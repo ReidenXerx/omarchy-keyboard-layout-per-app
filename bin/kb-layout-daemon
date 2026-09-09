@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Per-application keyboard layout: remember what you chose, restore it on focus.
+
+Focus Telegram, switch to Ukrainian, focus the terminal -- it returns to US. Focus Telegram
+again and Ukrainian comes back. KDE and Windows do this; Hyprland has a single global
+layout, so this supplies the memory.
+
+Apps with no assignment get layout INDEX 0 (first in kb_layout, i.e. US). Index rather than
+name because Hyprland reports display names ("English (US)") that vary with locale, while
+the index is stable.
+
+Keyed by window CLASS, so a second window of the same app inherits the choice.
+
+Assignments live in ~/.config/omarchy/kb-layout-per-app.json -- hand-editable, and managed
+by `kb-layout-app`.
+
+Two Hyprland quirks shape this:
+  * layout is per DEVICE and this laptop exposes ten keyboards, so all multi-layout devices
+    switch together or the one you type on drifts out of sync.
+  * applying a layout emits activelayout events of its own; those are suppressed briefly,
+    or restoring a remembered layout would immediately re-record it.
+"""
+import json, os, pathlib, socket, subprocess, sys, time
+
+CONFIG = pathlib.Path.home()/".config/omarchy/kb-layout-per-app.json"
+LEGACY = pathlib.Path.home()/".local/state/omarchy/kb-layout-per-app.json"
+
+def hypr_json(*a):
+    try:
+        return json.loads(subprocess.run(["hyprctl", *a], capture_output=True,
+                                         text=True, timeout=5).stdout)
+    except Exception:
+        return None
+
+def keyboards():
+    d = hypr_json("devices", "-j") or {}
+    return [k for k in d.get("keyboards", []) if "," in str(k.get("layout", ""))]
+
+def current():
+    ks = keyboards()
+    for k in ks:
+        if k.get("main"):
+            return k.get("active_keymap")
+    return ks[0].get("active_keymap") if ks else None
+
+def apply_index(i):
+    for k in keyboards():
+        subprocess.run(["hyprctl", "switchxkblayout", k["name"], str(i)],
+                       capture_output=True, timeout=5)
+
+def apply_name(name):
+    ks = keyboards()
+    if not ks:
+        return
+    n = len(str(ks[0].get("layout", "")).split(","))
+    for _ in range(n):
+        if current() == name:
+            return
+        for k in ks:
+            subprocess.run(["hyprctl", "switchxkblayout", k["name"], "next"],
+                           capture_output=True, timeout=5)
+        time.sleep(0.05)
+
+def save(d):
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
+    tmp.replace(CONFIG)
+
+def load():
+    try:
+        return json.loads(CONFIG.read_text())
+    except Exception:
+        pass
+    try:                                   # one-time migration from the old state path
+        d = json.loads(LEGACY.read_text())
+        save(d)
+        LEGACY.unlink(missing_ok=True)
+        return d
+    except Exception:
+        return {}
+
+def sock_path():
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    rt = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    if not sig:
+        d = pathlib.Path(rt)/"hypr"
+        c = sorted((p for p in d.iterdir() if (p/".socket2.sock").exists()),
+                   key=lambda p: p.stat().st_mtime, reverse=True) if d.is_dir() else []
+        if not c:
+            return None
+        sig = c[0].name
+    p = pathlib.Path(rt)/"hypr"/sig/".socket2.sock"
+    return p if p.exists() else None
+
+def main():
+    sp = sock_path()
+    if sp is None:
+        print("no hyprland event socket", file=sys.stderr)
+        return 1
+    cls, expected = None, None
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(str(sp))
+    buf = b""
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            ev = line.decode("utf-8", "replace")
+
+            if ev.startswith("activewindow>>"):
+                new = ev.split(">>", 1)[1].split(",", 1)[0].strip()
+                if not new or new == cls:
+                    continue
+                cls = new
+                want = load().get(cls)     # re-read: kb-layout-app may have changed it
+                if want:
+                    if want != current():
+                        apply_name(want)
+                else:
+                    apply_index(0)          # unassigned apps default to US
+                # Remember what WE just set. Applying a layout emits activelayout events,
+                # and a time window cannot bound them reliably: apply_* shells out to
+                # hyprctl once per keyboard (ten here), so the echo can arrive after any
+                # fixed delay and be recorded as if the user had chosen it -- which
+                # overwrote a real assignment during testing. Matching on the value is
+                # exact regardless of timing.
+                expected = current()
+
+            elif ev.startswith("activelayout>>"):
+                if not cls:
+                    continue
+                name = ev.split(">>", 1)[1].split(",", 1)[1].strip()
+                if not name:
+                    continue
+                if name == expected:
+                    continue               # our own echo, not a user choice
+                d = load()
+                if d.get(cls) != name:
+                    d[cls] = name
+                    save(d)
+                expected = name            # subsequent echoes of this switch are ours too
+    return 0
+
+sys.exit(main())

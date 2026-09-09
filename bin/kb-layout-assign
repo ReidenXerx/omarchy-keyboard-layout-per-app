@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Assign a keyboard layout to an application.
+
+  kb-layout-app                 pick an app, then a layout (native Omarchy menus)
+  kb-layout-app list            show current assignments
+  kb-layout-app set <class> <layout>
+  kb-layout-app clear <class>   back to the default (US)
+
+Assignments are read live by kb-layout-per-app, so changes apply on the next focus --
+nothing to restart. The file is plain JSON and safe to hand-edit.
+"""
+import json, pathlib, subprocess, sys
+
+CONFIG = pathlib.Path.home()/".config/omarchy/kb-layout-per-app.json"
+
+def load():
+    try:
+        return json.loads(CONFIG.read_text())
+    except Exception:
+        return {}
+
+def save(d):
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
+    tmp.replace(CONFIG)
+
+def hypr_json(*a):
+    try:
+        return json.loads(subprocess.run(["hyprctl", *a], capture_output=True,
+                                         text=True, timeout=5).stdout)
+    except Exception:
+        return None
+
+def layout_names():
+    """Display names in kb_layout order. Derived by cycling a keyboard and reading the name
+    back, because Hyprland exposes codes ("us,ua,ru") and names ("Ukrainian") separately
+    with no mapping between them."""
+    ks = [k for k in (hypr_json("devices", "-j") or {}).get("keyboards", [])
+          if "," in str(k.get("layout", ""))]
+    if not ks:
+        return []
+    dev, codes = ks[0]["name"], str(ks[0]["layout"]).split(",")
+    names, start = [], None
+    for i in range(len(codes)):
+        subprocess.run(["hyprctl", "switchxkblayout", dev, str(i)],
+                       capture_output=True, timeout=5)
+        d = hypr_json("devices", "-j") or {}
+        for k in d.get("keyboards", []):
+            if k["name"] == dev:
+                names.append(k.get("active_keymap"))
+        if start is None:
+            start = 0
+    subprocess.run(["hyprctl", "switchxkblayout", dev, "0"], capture_output=True, timeout=5)
+    return [n for n in names if n]
+
+def running_classes():
+    d = hypr_json("clients", "-j") or []
+    return {c.get("class") for c in d if c.get("class")}
+
+
+def installed_classes():
+    """Window classes for installed apps, so an app can be assigned before it is opened --
+    including tray-only apps that never show a window.
+
+    StartupWMClass is the app's own declaration of the class it will use, which is exactly
+    what the daemon keys on. Where it is absent, the desktop-file id is the best guess.
+    Hidden/NoDisplay entries are skipped: they are not apps the user launches."""
+    import configparser, glob
+    out = {}
+    dirs = ["/usr/share/applications", "/usr/local/share/applications",
+            str(pathlib.Path.home()/".local/share/applications")]
+    for d in dirs:
+        for f in glob.glob(d + "/*.desktop"):
+            cp = configparser.RawConfigParser(strict=False)
+            try:
+                cp.read(f, encoding="utf-8")
+                e = cp["Desktop Entry"]
+            except Exception:
+                continue
+            if e.get("NoDisplay", "").lower() == "true" or e.get("Hidden", "").lower() == "true":
+                continue
+            if e.get("Type", "Application") != "Application":
+                continue
+            cls = (e.get("StartupWMClass") or pathlib.Path(f).stem).strip()
+            # Some desktop files ship an unsubstituted placeholder (Chromium's
+            # "@@startup_wm_class"); others are wrappers whose stem is not a window class.
+            if not cls or cls.startswith("@") or "/" in cls:
+                continue
+            name = e.get("Name", cls)
+            out.setdefault(cls, name)
+    return out
+
+def menu(prompt, options):
+    try:
+        r = subprocess.run(["omarchy-menu-select", prompt, *options],
+                           capture_output=True, text=True, timeout=120)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "ui"
+
+    if cmd == "list":
+        d = load()
+        if not d:
+            print("no assignments — every app uses the default (US)")
+        for k, v in sorted(d.items()):
+            print(f"{k:32} {v}")
+        return 0
+
+    if cmd == "set" and len(argv) >= 4:
+        d = load(); d[argv[2]] = " ".join(argv[3:]); save(d)
+        print(f"{argv[2]} → {d[argv[2]]}")
+        return 0
+
+    if cmd == "clear" and len(argv) >= 3:
+        d = load()
+        if d.pop(argv[2], None) is None:
+            print(f"{argv[2]} had no assignment")
+        else:
+            save(d); print(f"{argv[2]} → default (US)")
+        return 0
+
+    # UI: pick an app, then a layout. Assigned apps are listed first so the menu doubles
+    # as a view of what is already set.
+    assigned = load()
+    running = running_classes()
+    installed = installed_classes()
+    apps = sorted(running | set(assigned) | set(installed), key=str.lower)
+    if not apps:
+        print("nothing to assign", file=sys.stderr)
+        return 1
+
+    # omarchy-menu-select reads the FIRST tab-separated field as an ICON GLYPH, the second
+    # as the label and the third as subtext. Passing "app\tlayout" therefore drew the app
+    # name on top of the layout. Always lead with a glyph.
+    rows = []
+    for a in apps:
+        glyph = "󰌌" if a in assigned else ("󰖯" if a in running else "󰀻")
+        sub = assigned.get(a) or ("running" if a in running else installed.get(a, ""))
+        rows.append(f"{glyph}\t{a}\t{sub}" if sub else f"{glyph}\t{a}")
+    picked = menu("Set layout for app", rows)
+    if not picked:
+        return 0
+    app = picked.split("\t")[0].strip()
+
+    names = layout_names()
+    if not names:
+        print("no multi-layout keyboard found", file=sys.stderr)
+        return 1
+    choice = menu(f"Layout for {app}", [*names, "Default (US)"])
+    if not choice:
+        return 0
+
+    d = load()
+    if choice.startswith("Default"):
+        d.pop(app, None); save(d)
+        print(f"{app} → default (US)")
+    else:
+        d[app] = choice; save(d)
+        print(f"{app} → {choice}")
+    return 0
+
+sys.exit(main(sys.argv))
