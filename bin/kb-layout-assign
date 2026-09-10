@@ -5,6 +5,7 @@
   kb-layout-app list            show current assignments
   kb-layout-app set <class> <layout>
   kb-layout-app clear <class>   back to the default (US)
+  kb-layout-app clear-ui        pick an assignment to clear
 
 Assignments are read live by kb-layout-per-app, so changes apply on the next focus --
 nothing to restart. The file is plain JSON and safe to hand-edit.
@@ -113,6 +114,25 @@ def main(argv):
     if cmd == "set" and len(argv) >= 4:
         d = load(); d[argv[2]] = " ".join(argv[3:]); save(d)
         print(f"{argv[2]} → {d[argv[2]]}")
+        return 0
+
+    if cmd == "clear-ui":
+        # Interactive counterpart to [H[2J[3J, so the Omarchy menu can offer it without
+        # the caller having to know an app's window class by heart.
+        d = load()
+        if not d:
+            subprocess.run(["omarchy-notification-send", "Keyboard layout",
+                            "No assignments to clear"], check=False)
+            return 0
+        rows = [f"󰅖\t{app}\t{layout}" for app, layout in sorted(d.items())]
+        picked = menu("Clear layout for app", rows)
+        if not picked:
+            return 0
+        app = picked.split("	")[0].strip()
+        if d.pop(app, None) is not None:
+            save(d)
+            subprocess.run(["omarchy-notification-send", "Keyboard layout",
+                            f"{app} back to the default"], check=False)
         return 0
 
     if cmd == "clear" and len(argv) >= 3:

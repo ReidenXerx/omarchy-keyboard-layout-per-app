@@ -76,6 +76,29 @@ Keyed by window **class**, so a second window of the same app inherits the choic
 `omarchy.keyboard-layout` widget by David Heinemeier Hansson, MIT licensed. This plugin adds
 the per-application memory, the picker, and the daemon.
 
+## Menu entries
+
+Optional Omarchy menu routes (assign, list, clear):
+
+```bash
+bin/kb-layout-menu-install          # add them
+bin/kb-layout-menu-install remove   # take them out
+```
+
+It writes only between its own marker comments in
+`~/.config/omarchy/extensions/omarchy-menu.jsonc` and rolls back rather than leaving that
+file unparseable.
+
+## Remove
+
+```bash
+bin/kb-layout-menu-install remove
+omarchy plugin remove reidenxerx.keyboard-layout-per-app
+```
+
+Assignments stay in `~/.config/omarchy/kb-layout-per-app.json`; delete it to forget them.
+The layout daemon stops with the shell, so nothing is left running.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

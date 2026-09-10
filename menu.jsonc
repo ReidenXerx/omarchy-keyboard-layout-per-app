@@ -1,0 +1,20 @@
+  "setup.keyboard-layout": {
+    "icon": "󰌌",
+    "label": "Keyboard layout per app",
+    "aliases": ["layout", "keyboard", "language", "input", "raskladka"]
+  },
+  "setup.keyboard-layout.assign": {
+    "icon": "󰌌",
+    "label": "Set layout for an app",
+    "action": "@PLUGIN_BIN@/kb-layout-assign"
+  },
+  "setup.keyboard-layout.list": {
+    "icon": "󰋽",
+    "label": "Show assignments",
+    "action": "omarchy-launch-floating-terminal-with-presentation @PLUGIN_BIN@/kb-layout-assign list"
+  },
+  "setup.keyboard-layout.clear": {
+    "icon": "󰅖",
+    "label": "Clear an assignment",
+    "action": "@PLUGIN_BIN@/kb-layout-assign clear-ui"
+  },
