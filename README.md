@@ -1,5 +1,7 @@
 # Keyboard layout per app
 
+![Keyboard layout per app](preview.png)
+
 An [Omarchy](https://omarchy.org) bar widget that remembers the **keyboard layout per
 application** and restores it when you focus that app.
 
