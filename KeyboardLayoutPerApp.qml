@@ -37,6 +37,25 @@ BarWidget {
   // rather than dropping it; nothing else would correct the label afterwards.
   property bool refreshPending: false
 
+  // Clicks that arrived while a switch was still running, replayed one at a
+  // time once it lands so each click still advances a layout.
+  property int cyclesQueued: 0
+
+  // Every process this widget starts is a helper shipped in bin/, run by the
+  // system interpreter by absolute path -- never hyprctl, xkbcli or a shell
+  // looked up on PATH. The helpers give what they run a deadline, an output
+  // ceiling and a process-group kill, and print only bounded, checked fields.
+  // Qt.resolvedUrl() resolves relative to this QML file; Process wants a plain
+  // path, so the file:// scheme is stripped.
+  readonly property string pluginBin: decodeURIComponent(String(Qt.resolvedUrl("bin/")).replace(/^file:\/\//, ""))
+  readonly property string python: "/usr/bin/python3"
+  readonly property string helper: pluginBin + "kb-layout-assign"
+  // Far above anything a helper prints (a seat's keyboards, the layout table),
+  // so a reading past it is refused rather than parsed.
+  readonly property int maxHelperOutput: 512 * 1024
+  // How long a helper that was asked to stop gets before it is SIGKILLed.
+  readonly property int killGraceMs: 1500
+
   function refresh() {
     if (queryProc.running) {
       refreshPending = true
@@ -45,6 +64,16 @@ BarWidget {
 
     refreshPending = false
     queryProc.running = true
+  }
+
+  // Stopping a Process sends SIGTERM and leaves it running until it exits. The
+  // helpers answer SIGTERM by killing the process group of everything they
+  // started, so that is normally the end of it; one still there after the grace
+  // period is SIGKILLed, and whatever it started dies on its own deadline.
+  function stopProcess(proc, killTimer) {
+    if (!proc.running) return
+    proc.running = false
+    killTimer.restart()
   }
 
   // Keyboards someone can actually type on, which is not everything Hyprland
@@ -73,7 +102,12 @@ BarWidget {
   // follows the button.
   function cycleLayout() {
     if (!root.keyboardName || !root.bar) return
-    root.bar.run("hyprctl switchxkblayout " + Util.shellQuote(root.keyboardName) + " next")
+    if (cycleProc.running) {
+      root.cyclesQueued = Math.min(root.cyclesQueued + 1, 8)
+      return
+    }
+    cycleProc.command = [root.python, root.helper, "cycle", root.keyboardName]
+    cycleProc.running = true
     refreshTimer.restart()
   }
 
@@ -101,9 +135,11 @@ BarWidget {
     }
   }
 
+  // The seat's keyboards, as `hyprctl -j devices` reports them, reduced by the
+  // helper to the fields read here.
   Process {
     id: queryProc
-    command: ["hyprctl", "-j", "devices"]
+    command: [root.python, root.helper, "devices"]
     onRunningChanged: {
       if (running) {
         stallTimer.restart()
@@ -111,11 +147,14 @@ BarWidget {
       }
 
       stallTimer.stop()
+      queryKillTimer.stop()
       if (root.refreshPending) root.refresh()
     }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
+        if (text.length > root.maxHelperOutput) return
+
         let listed
         try {
           listed = JSON.parse(text || "{}").keyboards
@@ -158,12 +197,42 @@ BarWidget {
   // leave it alone. The bar is built per monitor, so this runs once per widget.
   // The exotic rulesets cover layouts like trans (IPA) that ship in the same xkb
   // package and set just as well, so load them or those labels lose their code.
+  // The helper passes on only the lines KeyboardLayoutModel.layoutBriefs() reads.
   Process {
     id: briefsProc
-    command: ["xkbcli", "list", "--load-exotic"]
+    command: [root.python, root.helper, "layouts"]
+    onRunningChanged: {
+      if (running) {
+        briefsStallTimer.restart()
+        return
+      }
+
+      briefsStallTimer.stop()
+      briefsKillTimer.stop()
+    }
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.layoutBriefs = KeyboardLayoutModel.layoutBriefs(text)
+      onStreamFinished: {
+        if (text.length > root.maxHelperOutput) return
+        root.layoutBriefs = KeyboardLayoutModel.layoutBriefs(text)
+      }
+    }
+  }
+
+  Process {
+    id: cycleProc
+    onRunningChanged: {
+      if (running) {
+        cycleStallTimer.restart()
+        return
+      }
+
+      cycleStallTimer.stop()
+      cycleKillTimer.stop()
+      if (root.cyclesQueued > 0) {
+        root.cyclesQueued -= 1
+        root.cycleLayout()
+      }
     }
   }
 
@@ -182,9 +251,41 @@ BarWidget {
     id: stallTimer
     interval: 5000
     onTriggered: {
-      queryProc.running = false
+      root.stopProcess(queryProc, queryKillTimer)
       refreshTimer.restart()
     }
+  }
+
+  Timer {
+    id: queryKillTimer
+    interval: root.killGraceMs
+    onTriggered: if (queryProc.running) queryProc.signal(9)
+  }
+
+  // xkbcli gets ten seconds inside the helper; this only catches a helper that
+  // outlives its own deadline.
+  Timer {
+    id: briefsStallTimer
+    interval: 20000
+    onTriggered: root.stopProcess(briefsProc, briefsKillTimer)
+  }
+
+  Timer {
+    id: briefsKillTimer
+    interval: root.killGraceMs
+    onTriggered: if (briefsProc.running) briefsProc.signal(9)
+  }
+
+  Timer {
+    id: cycleStallTimer
+    interval: 5000
+    onTriggered: root.stopProcess(cycleProc, cycleKillTimer)
+  }
+
+  Timer {
+    id: cycleKillTimer
+    interval: root.killGraceMs
+    onTriggered: if (cycleProc.running) cycleProc.signal(9)
   }
 
   // Which keyboard on a crowded seat the label is describing can change without
@@ -193,7 +294,7 @@ BarWidget {
   // ambiguity, until a first reading lands so a query that failed at login still
   // recovers, and while a reading has left the seat's shape in doubt. The
   // one-keyboard install has none of those, and is left alone rather than
-  // spawning hyprctl forever for an answer that cannot change.
+  // spawning a query forever for an answer that cannot change.
   Timer {
     interval: 10000
     running: !root.keyboardName || root.keyboardUnresolved || root.keyboardCount > 1
@@ -201,22 +302,20 @@ BarWidget {
     onTriggered: root.refresh()
   }
 
-  // Both helpers ship inside the plugin, so installing the repo is all that is needed.
-  // Qt.resolvedUrl() resolves relative to this QML file; Process wants a plain path, so the
-  // file:// scheme is stripped.
-  readonly property string pluginBin: String(Qt.resolvedUrl("bin/")).replace("file://", "")
-
+  // The picker. Interactive, so no watchdog: its menus carry their own deadline
+  // inside the helper.
   Process {
     id: assignProc
-    command: [root.pluginBin + "kb-layout-assign"]
+    command: [root.python, root.helper]
   }
 
   // The daemon that restores each app's layout on focus. Started by the widget rather than
   // by an autostart entry: a plugin cannot edit the user's hypr config, and tying its life
-  // to the shell means it stops cleanly when the shell does.
+  // to the shell means it stops cleanly when the shell does (it also asks the kernel to
+  // signal it if the shell dies).
   Process {
     id: daemonProc
-    command: [root.pluginBin + "kb-layout-daemon"]
+    command: [root.python, root.pluginBin + "kb-layout-daemon"]
     running: true
   }
 

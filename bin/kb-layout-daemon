@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Per-application keyboard layout: remember what you chose, restore it on focus.
 
 Focus Telegram, switch to Ukrainian, focus the terminal -- it returns to US. Focus Telegram
@@ -12,137 +12,295 @@ the index is stable.
 Keyed by window CLASS, so a second window of the same app inherits the choice.
 
 Assignments live in ~/.config/omarchy/kb-layout-per-app.json -- hand-editable, and managed
-by `kb-layout-app`.
+by `kb-layout-assign`.
 
 Two Hyprland quirks shape this:
-  * layout is per DEVICE and this laptop exposes ten keyboards, so all multi-layout devices
+  * layout is per DEVICE and a laptop can expose ten keyboards, so all multi-layout devices
     switch together or the one you type on drifts out of sync.
-  * applying a layout emits activelayout events of its own; those are suppressed briefly,
-    or restoring a remembered layout would immediately re-record it.
+  * applying a layout emits activelayout events of its own; those are recognised by VALUE
+    (see LayoutMemory.window), or restoring a remembered layout would re-record it.
+
+Bounds: the daemon exits with the shell that started it; event frames over
+MAX_EVENT_LINE are dropped and the read buffer never holds more than MAX_EVENT_BUFFER;
+class and layout names over kb_layout.MAX_NAME characters, or with control characters, are
+never stored; at most kb_layout.MAX_APPS apps are remembered.
 """
-import json, os, pathlib, socket, subprocess, sys, time
+import os
+import re
+import socket
+import stat
+import sys
+import time
 
-CONFIG = pathlib.Path.home()/".config/omarchy/kb-layout-per-app.json"
-LEGACY = pathlib.Path.home()/".local/state/omarchy/kb-layout-per-app.json"
+sys.dont_write_bytecode = True  # never write __pycache__ into the plugin directory
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import plugin_safety as safe  # noqa: E402
+import kb_layout as kb  # noqa: E402
 
-def hypr_json(*a):
-    try:
-        return json.loads(subprocess.run(["hyprctl", *a], capture_output=True,
-                                         text=True, timeout=5).stdout)
-    except Exception:
-        return None
+MAX_EVENT_LINE = 4 * 1024
+MAX_EVENT_BUFFER = 64 * 1024
+RECV_SIZE = 4096
+_SIGNATURE = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 
-def keyboards():
-    d = hypr_json("devices", "-j") or {}
-    return [k for k in d.get("keyboards", []) if "," in str(k.get("layout", ""))]
 
-def current():
-    ks = keyboards()
-    for k in ks:
-        if k.get("main"):
-            return k.get("active_keymap")
-    return ks[0].get("active_keymap") if ks else None
+# ------------------------------------------------------------------ event framing
 
-def apply_index(i):
-    for k in keyboards():
-        subprocess.run(["hyprctl", "switchxkblayout", k["name"], str(i)],
-                       capture_output=True, timeout=5)
+class LineReader:
+    """Newline-framed events with hard limits. A frame longer than max_line is dropped
+    whole -- everything up to its newline is skipped -- and the buffer is reset if it ever
+    exceeds max_buffer, so the socket can cost at most max_buffer bytes of memory."""
+
+    def __init__(self, max_line=MAX_EVENT_LINE, max_buffer=MAX_EVENT_BUFFER):
+        self.max_line, self.max_buffer = max_line, max_buffer
+        self.buf = bytearray()
+        self.skipping = False
+        self.dropped = 0
+
+    def feed(self, chunk):
+        lines = []
+        self.buf += chunk
+        if len(self.buf) > self.max_buffer:
+            self.buf.clear()
+            self.skipping = True
+            self.dropped += 1
+            return lines
+        start = 0
+        while True:
+            newline = self.buf.find(b"\n", start)
+            if newline < 0:
+                break
+            line = bytes(self.buf[start:newline])
+            start = newline + 1
+            if self.skipping:          # the tail of a frame already dropped
+                self.skipping = False
+                continue
+            if len(line) > self.max_line:
+                self.dropped += 1
+                continue
+            lines.append(line)
+        del self.buf[:start]
+        if len(self.buf) > self.max_line:
+            self.buf.clear()
+            if not self.skipping:
+                self.dropped += 1
+            self.skipping = True
+        return lines
+
+
+def parse_event(line):
+    """("window", class) or ("layout", layout name) for the two events acted on, else None.
+    Values are raw; LayoutMemory checks them."""
+    event = line.decode("utf-8", "replace")
+    if event.startswith("activewindow>>"):
+        return "window", event.split(">>", 1)[1].split(",", 1)[0].strip()
+    if event.startswith("activelayout>>"):
+        payload = event.split(">>", 1)[1]
+        if "," not in payload:
+            return None
+        # keyboard,layout -- the layout name may itself contain commas
+        return "layout", payload.split(",", 1)[1].strip()
+    return None
+
+
+# ------------------------------------------------------------------ applying layouts
+
+def current_layout():
+    keyboards = kb.switchable_keyboards()
+    for keyboard in keyboards:
+        if keyboard.get("main"):
+            return keyboard.get("active_keymap")
+    return keyboards[0].get("active_keymap") if keyboards else None
+
+
+def apply_index(index):
+    for keyboard in kb.switchable_keyboards():
+        kb.switch_layout(keyboard["name"], index)
+
 
 def apply_name(name):
-    ks = keyboards()
-    if not ks:
+    keyboards = kb.switchable_keyboards()
+    if not keyboards:
         return
-    n = len(str(ks[0].get("layout", "")).split(","))
-    for _ in range(n):
-        if current() == name:
+    count = min(len(keyboards[0]["layout"].split(",")), kb.MAX_LAYOUTS)
+    for _ in range(count):
+        if current_layout() == name:
             return
-        for k in ks:
-            subprocess.run(["hyprctl", "switchxkblayout", k["name"], "next"],
-                           capture_output=True, timeout=5)
+        for keyboard in keyboards:
+            kb.switch_layout(keyboard["name"], "next")
         time.sleep(0.05)
 
-def save(d):
-    CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    tmp = CONFIG.with_suffix(".tmp")
-    tmp.write_text(json.dumps(d, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
-    tmp.replace(CONFIG)
 
-def load():
+class LayoutMemory:
+    """Applies an app's layout when it is focused and records the layout chosen while it is.
+    The hyprctl and file operations are parameters so tests can observe them."""
+
+    def __init__(self, load=kb.load_config, save=kb.save_config, current=current_layout,
+                 apply_index=apply_index, apply_name=apply_name):
+        self.load, self.save, self.current = load, save, current
+        self.apply_index, self.apply_name = apply_index, apply_name
+        self.cls = None
+        self.expected = None
+
+    def window(self, new):
+        if not new or new == self.cls:
+            return
+        if kb.clean_name(new) is None:
+            # A class too long or odd to store can never have an assignment, so it gets what
+            # every unassigned app gets -- and no layout is recorded against it, or against
+            # the app focused before it.
+            kb.log("focused window has an unusable class; using the default layout")
+            self.cls = None
+            self.apply_index(0)
+            self.expected = self.current()
+            return
+        self.cls = new
+        want = self.load()[0].get(new)     # re-read: kb-layout-assign may have changed it
+        if want:
+            if want != self.current():
+                self.apply_name(want)
+        else:
+            self.apply_index(0)            # unassigned apps default to the first layout
+        # Remember what WE just set. Applying a layout emits activelayout events, and a time
+        # window cannot bound them reliably: apply_* runs hyprctl once per keyboard (ten on a
+        # laptop), so the echo can arrive after any fixed delay and be recorded as if the
+        # user had chosen it -- which overwrote a real assignment during testing. Matching
+        # on the value is exact regardless of timing.
+        self.expected = self.current()
+
+    def layout(self, name):
+        if not self.cls or not name:
+            return
+        if kb.clean_name(name) is None:
+            kb.log("layout name is too long or has control characters; not recording it")
+            return
+        if name == self.expected:
+            return                          # our own echo, not a user choice
+        assignments, writable = self.load()
+        if assignments.get(self.cls) != name:
+            if not writable:
+                kb.log(f"not recording {self.cls}: the assignments file is unusable")
+            else:
+                result = kb.assign(assignments, self.cls, name)
+                if result == "full":
+                    kb.log(f"{kb.MAX_APPS} apps already have a layout; not remembering one for "
+                           f"{self.cls} (clear some with kb-layout-assign clear-ui)")
+                elif result == "changed":
+                    try:
+                        self.save(assignments)
+                    except (safe.UnsafeError, OSError) as e:
+                        kb.log(f"could not save assignments: {e}")
+        self.expected = name                # subsequent echoes of this switch are ours too
+
+
+# ------------------------------------------------------------------ the event socket
+
+def _owned_dir(name, dir_fd):
+    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+    st = os.fstat(fd)
+    if st.st_uid != os.getuid() or st.st_mode & 0o022:
+        os.close(fd)
+        raise safe.UnsafeError(f"{name}: directory is not ours or is group/other-writable")
+    return fd
+
+
+def event_socket_fd(signature):
+    """O_PATH descriptor of $XDG_RUNTIME_DIR/hypr/<signature>/.socket2.sock, reached one
+    component at a time without following symlinks, and only if every directory and the
+    socket itself belong to us."""
+    if not _SIGNATURE.fullmatch(signature or "") or signature in (".", ".."):
+        raise safe.UnsafeError("invalid Hyprland instance signature")
+    fd = os.open(safe.runtime_dir(), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
-        return json.loads(CONFIG.read_text())
-    except Exception:
-        pass
-    try:                                   # one-time migration from the old state path
-        d = json.loads(LEGACY.read_text())
-        save(d)
-        LEGACY.unlink(missing_ok=True)
-        return d
-    except Exception:
-        return {}
+        st = os.fstat(fd)
+        if st.st_uid != os.getuid() or st.st_mode & 0o022:
+            raise safe.UnsafeError("runtime directory is not ours or is group/other-writable")
+        for part in ("hypr", signature):
+            next_fd = _owned_dir(part, fd)
+            os.close(fd)
+            fd = next_fd
+        sock = os.open(".socket2.sock", os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+        st = os.fstat(sock)
+        if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
+            os.close(sock)
+            raise safe.UnsafeError(".socket2.sock is not a socket we own")
+        return sock
+    finally:
+        os.close(fd)
 
-def sock_path():
-    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
-    rt = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-    if not sig:
-        d = pathlib.Path(rt)/"hypr"
-        c = sorted((p for p in d.iterdir() if (p/".socket2.sock").exists()),
-                   key=lambda p: p.stat().st_mtime, reverse=True) if d.is_dir() else []
-        if not c:
-            return None
-        sig = c[0].name
-    p = pathlib.Path(rt)/"hypr"/sig/".socket2.sock"
-    return p if p.exists() else None
+
+def find_signature():
+    signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if signature:
+        return signature
+    try:
+        entries = safe.list_dir(os.path.join(safe.runtime_dir(), "hypr"), max_entries=64)
+    except (safe.UnsafeError, OSError):
+        return None
+    candidates = sorted(((st.st_mtime, name) for name, st in entries
+                         if stat.S_ISDIR(st.st_mode) and _SIGNATURE.fullmatch(name)), reverse=True)
+    for _, name in candidates:
+        try:
+            os.close(event_socket_fd(name))
+            return name
+        except (safe.UnsafeError, OSError):
+            continue
+    return None
+
+
+def connect_events():
+    signature = find_signature()
+    if not signature:
+        return None
+    fd = event_socket_fd(signature)
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC)
+        try:
+            # Connecting through the descriptor means the path checked above is the socket
+            # connected to; nothing can be swapped in between.
+            sock.connect(f"/proc/self/fd/{fd}")
+        except OSError:
+            sock.close()
+            raise
+        return sock
+    finally:
+        os.close(fd)
+
 
 def main():
-    sp = sock_path()
-    if sp is None:
-        print("no hyprland event socket", file=sys.stderr)
+    safe.die_with_parent()
+    kb.exit_cleanly_on_signals()
+    try:
+        sock = connect_events()
+    except (safe.UnsafeError, OSError) as e:
+        print(f"kb-layout-daemon: {e}", file=sys.stderr)
         return 1
-    cls, expected = None, None
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.connect(str(sp))
-    buf = b""
-    while True:
-        chunk = s.recv(4096)
-        if not chunk:
-            break
-        buf += chunk
-        while b"\n" in buf:
-            line, buf = buf.split(b"\n", 1)
-            ev = line.decode("utf-8", "replace")
-
-            if ev.startswith("activewindow>>"):
-                new = ev.split(">>", 1)[1].split(",", 1)[0].strip()
-                if not new or new == cls:
+    if sock is None:
+        print("kb-layout-daemon: no hyprland event socket", file=sys.stderr)
+        return 1
+    reader, memory, dropped = LineReader(), LayoutMemory(), 0
+    with sock:
+        while True:
+            try:
+                chunk = sock.recv(RECV_SIZE)
+            except OSError as e:
+                print(f"kb-layout-daemon: {e}", file=sys.stderr)
+                return 1
+            if not chunk:
+                break
+            for line in reader.feed(chunk):
+                event = parse_event(line)
+                if event is None:
                     continue
-                cls = new
-                want = load().get(cls)     # re-read: kb-layout-app may have changed it
-                if want:
-                    if want != current():
-                        apply_name(want)
+                kind, value = event
+                if kind == "window":
+                    memory.window(value)
                 else:
-                    apply_index(0)          # unassigned apps default to US
-                # Remember what WE just set. Applying a layout emits activelayout events,
-                # and a time window cannot bound them reliably: apply_* shells out to
-                # hyprctl once per keyboard (ten here), so the echo can arrive after any
-                # fixed delay and be recorded as if the user had chosen it -- which
-                # overwrote a real assignment during testing. Matching on the value is
-                # exact regardless of timing.
-                expected = current()
-
-            elif ev.startswith("activelayout>>"):
-                if not cls:
-                    continue
-                name = ev.split(">>", 1)[1].split(",", 1)[1].strip()
-                if not name:
-                    continue
-                if name == expected:
-                    continue               # our own echo, not a user choice
-                d = load()
-                if d.get(cls) != name:
-                    d[cls] = name
-                    save(d)
-                expected = name            # subsequent echoes of this switch are ours too
+                    memory.layout(value)
+            if reader.dropped != dropped:
+                dropped = reader.dropped
+                kb.log(f"dropped {dropped} oversized event frame(s)")
     return 0
 
-sys.exit(main())
+
+if __name__ == "__main__":
+    sys.exit(main())

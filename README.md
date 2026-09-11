@@ -72,6 +72,35 @@ Three details that are easy to get wrong, each of which broke a build during dev
 
 Keyed by window **class**, so a second window of the same app inherits the choice.
 
+## Security
+
+The plugin runs as you, next to other processes that also run as you, so it does not trust
+what it reads or the paths it writes:
+
+- **No shell, no PATH.** The widget starts only its own helpers, as
+  `/usr/bin/python3 <plugin>/bin/…`. The helpers run `hyprctl`, `xkbcli`,
+  `omarchy-menu-select` and `omarchy-notification-send` by absolute path, only if they are
+  root-owned and not writable by others (`bin/plugin_safety.py`, shared by the ReidenXerx
+  plugins). Children get `PATH=/usr/bin`, a deadline, an output ceiling (hyprctl 256 KB,
+  xkbcli 2 MB, menus 64 KB) and a whole-process-group kill, and run under
+  `/usr/bin/timeout` so they die even if their helper is killed.
+- **Bounded output to QML.** `kb-layout-assign devices` prints at most 64 keyboards and only
+  the four fields the widget reads; `layouts` prints only the lines the label table uses. The
+  widget refuses readings over 512 KB. A stuck helper gets SIGTERM from the watchdog (it then
+  kills everything it started) and SIGKILL 1.5 s later.
+- **Bounded events.** The daemon reads Hyprland's event socket, opened without following
+  symlinks, through a 4 KB-per-event, 64 KB-total buffer, dropping oversized events. Window
+  classes and layout names over 256 characters or with control characters are never stored.
+  At most 500 apps are remembered; past that a new app is refused and logged, never evicted.
+  The daemon exits with the shell that started it.
+- **Safe file handling.** The assignments file is read with a 128 KB cap and only if it is
+  a regular file you own, reached without symlinks. Writes go to a random `O_EXCL`
+  temporary file in the same directory, are fsynced and renamed over the destination. If the
+  file is unreadable or not valid JSON, the plugin leaves it alone rather than overwrite it.
+  The menu installer follows the same rules and never writes a side `.bak` file.
+
+Tests: `python3 tests/helpers_test.py` and `node tests/model-test.js`.
+
 ## Credits
 
 `KeyboardLayoutModel.js` and the widget's layout-querying logic come from Omarchy's built-in

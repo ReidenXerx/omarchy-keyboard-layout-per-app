@@ -1,186 +1,256 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Assign a keyboard layout to an application.
 
-  kb-layout-app                 pick an app, then a layout (native Omarchy menus)
-  kb-layout-app list            show current assignments
-  kb-layout-app set <class> <layout>
-  kb-layout-app clear <class>   back to the default (US)
-  kb-layout-app clear-ui        pick an assignment to clear
+  kb-layout-assign                    pick an app, then a layout (native Omarchy menus)
+  kb-layout-assign list               show current assignments
+  kb-layout-assign set <class> <layout>
+  kb-layout-assign clear <class>      back to the default (US)
+  kb-layout-assign clear-ui           pick an assignment to clear
 
-Assignments are read live by kb-layout-per-app, so changes apply on the next focus --
+For the bar widget -- bounded, machine-readable:
+
+  kb-layout-assign devices            keyboards as JSON (name, layout, active_keymap,
+                                      active_layout_index); prints nothing if hyprctl failed
+  kb-layout-assign layouts            the brief/description lines of `xkbcli list --load-exotic`
+  kb-layout-assign cycle <keyboard>   advance one keyboard to its next layout
+
+Assignments are read live by kb-layout-daemon, so changes apply on the next focus --
 nothing to restart. The file is plain JSON and safe to hand-edit.
 """
-import json, pathlib, subprocess, sys
+import json
+import os
+import sys
 
-CONFIG = pathlib.Path.home()/".config/omarchy/kb-layout-per-app.json"
+sys.dont_write_bytecode = True  # never write __pycache__ into the plugin directory
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import plugin_safety as safe  # noqa: E402
+import kb_layout as kb  # noqa: E402
 
-def load():
-    try:
-        return json.loads(CONFIG.read_text())
-    except Exception:
-        return {}
+DEFAULT_ROW = "Default (US)"
 
-def save(d):
-    CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    tmp = CONFIG.with_suffix(".tmp")
-    tmp.write_text(json.dumps(d, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
-    tmp.replace(CONFIG)
 
-def hypr_json(*a):
-    try:
-        return json.loads(subprocess.run(["hyprctl", *a], capture_output=True,
-                                         text=True, timeout=5).stdout)
-    except Exception:
-        return None
+def usage():
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+def err(message):
+    print(f"kb-layout-assign: {message}", file=sys.stderr)
+
+
+# ------------------------------------------------------------------ widget subcommands
+
+def cmd_devices(args):
+    keyboards = kb.seat_keyboards()
+    if keyboards is None:
+        # Print nothing: an empty list would read as a seat with no keyboards, and the
+        # widget would drop its label for a query that merely failed.
+        return 1
+    sys.stdout.write(json.dumps(kb.widget_keyboards(keyboards), ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_layouts(args):
+    blob = kb.output_of(["xkbcli", "list", "--load-exotic"],
+                        timeout=kb.XKBCLI_TIMEOUT, max_output=kb.XKBCLI_MAX_OUTPUT)
+    if blob is None:
+        return 1
+    sys.stdout.write(kb.layout_listing(blob.decode("utf-8", "replace")) + "\n")
+    return 0
+
+
+def cmd_cycle(args):
+    if len(args) != 1 or not kb.device_name(args[0]):
+        return usage()
+    return 0 if kb.switch_layout(args[0], "next") else 1
+
+
+# ------------------------------------------------------------------ assignments
 
 def layout_names():
     """Display names in kb_layout order. Derived by cycling a keyboard and reading the name
     back, because Hyprland exposes codes ("us,ua,ru") and names ("Ukrainian") separately
     with no mapping between them."""
-    ks = [k for k in (hypr_json("devices", "-j") or {}).get("keyboards", [])
-          if "," in str(k.get("layout", ""))]
-    if not ks:
+    keyboards = kb.switchable_keyboards()
+    if not keyboards:
         return []
-    dev, codes = ks[0]["name"], str(ks[0]["layout"]).split(",")
-    names, start = [], None
-    for i in range(len(codes)):
-        subprocess.run(["hyprctl", "switchxkblayout", dev, str(i)],
-                       capture_output=True, timeout=5)
-        d = hypr_json("devices", "-j") or {}
-        for k in d.get("keyboards", []):
-            if k["name"] == dev:
-                names.append(k.get("active_keymap"))
-        if start is None:
-            start = 0
-    subprocess.run(["hyprctl", "switchxkblayout", dev, "0"], capture_output=True, timeout=5)
-    return [n for n in names if n]
-
-def running_classes():
-    d = hypr_json("clients", "-j") or []
-    return {c.get("class") for c in d if c.get("class")}
+    device = keyboards[0]["name"]
+    codes = keyboards[0]["layout"].split(",")[:kb.MAX_LAYOUTS]
+    names = []
+    for index in range(len(codes)):
+        kb.switch_layout(device, index)
+        for keyboard in kb.seat_keyboards() or []:
+            if keyboard.get("name") == device:
+                name = kb.clean_name(keyboard.get("active_keymap"))
+                if name:
+                    names.append(name)
+                break
+    kb.switch_layout(device, 0)
+    return names
 
 
-def installed_classes():
-    """Window classes for installed apps, so an app can be assigned before it is opened --
-    including tray-only apps that never show a window.
+def writable_config(interactive):
+    assignments, writable = kb.load_config()
+    if not writable:
+        message = f"{kb.CONFIG} is unusable (see above); fix or remove it first"
+        err(message)
+        if interactive:
+            kb.notify(f"Cannot update {kb.CONFIG}")
+    return assignments, writable
 
-    StartupWMClass is the app's own declaration of the class it will use, which is exactly
-    what the daemon keys on. Where it is absent, the desktop-file id is the best guess.
-    Hidden/NoDisplay entries are skipped: they are not apps the user launches."""
-    import configparser, glob
-    out = {}
-    dirs = ["/usr/share/applications", "/usr/local/share/applications",
-            str(pathlib.Path.home()/".local/share/applications")]
-    for d in dirs:
-        for f in glob.glob(d + "/*.desktop"):
-            cp = configparser.RawConfigParser(strict=False)
-            try:
-                cp.read(f, encoding="utf-8")
-                e = cp["Desktop Entry"]
-            except Exception:
-                continue
-            if e.get("NoDisplay", "").lower() == "true" or e.get("Hidden", "").lower() == "true":
-                continue
-            if e.get("Type", "Application") != "Application":
-                continue
-            cls = (e.get("StartupWMClass") or pathlib.Path(f).stem).strip()
-            # Some desktop files ship an unsubstituted placeholder (Chromium's
-            # "@@startup_wm_class"); others are wrappers whose stem is not a window class.
-            if not cls or cls.startswith("@") or "/" in cls:
-                continue
-            name = e.get("Name", cls)
-            out.setdefault(cls, name)
-    return out
 
-def menu(prompt, options):
-    try:
-        r = subprocess.run(["omarchy-menu-select", prompt, *options],
-                           capture_output=True, text=True, timeout=120)
-        return r.stdout.strip() if r.returncode == 0 else ""
-    except Exception:
-        return ""
+def cmd_list(args):
+    assignments, readable = kb.load_config()
+    if not readable:
+        err(f"cannot read {kb.CONFIG}")
+        return 1
+    if not assignments:
+        print("no assignments — every app uses the default (US)")
+    for app, layout in sorted(assignments.items()):
+        print(f"{app:32} {layout}")
+    return 0
 
-def main(argv):
-    cmd = argv[1] if len(argv) > 1 else "ui"
 
-    if cmd == "list":
-        d = load()
-        if not d:
-            print("no assignments — every app uses the default (US)")
-        for k, v in sorted(d.items()):
-            print(f"{k:32} {v}")
+def cmd_set(args):
+    if len(args) < 2:
+        return usage()
+    app = kb.clean_name(args[0].strip())
+    layout = kb.clean_name(" ".join(args[1:]).strip())
+    if not app or not layout:
+        err(f"class and layout must be printable and at most {kb.MAX_NAME} characters")
+        return 2
+    assignments, writable = writable_config(False)
+    if not writable:
+        return 1
+    result = kb.assign(assignments, app, layout)
+    if result == "full":
+        err(f"{kb.MAX_APPS} apps already have a layout; clear one first")
+        return 1
+    if result == "changed":
+        kb.save_config(assignments)
+    print(f"{app} → {layout}")
+    return 0
+
+
+def cmd_clear(args):
+    if len(args) < 1:
+        return usage()
+    app = args[0]
+    assignments, writable = writable_config(False)
+    if not writable:
+        return 1
+    if assignments.pop(app, None) is None:
+        print(f"{app} had no assignment")
+    else:
+        kb.save_config(assignments)
+        print(f"{app} → default (US)")
+    return 0
+
+
+def cmd_clear_ui(args):
+    # Interactive counterpart to `clear`, so the Omarchy menu can offer it without the
+    # caller having to know an app's window class by heart.
+    assignments, writable = writable_config(True)
+    if not writable:
+        return 1
+    if not assignments:
+        kb.notify("No assignments to clear")
         return 0
-
-    if cmd == "set" and len(argv) >= 4:
-        d = load(); d[argv[2]] = " ".join(argv[3:]); save(d)
-        print(f"{argv[2]} → {d[argv[2]]}")
+    rows = [f"󰅖\t{app}\t{layout}" for app, layout in sorted(assignments.items())]
+    picked = kb.menu("Clear layout for app", rows)
+    if not picked:
         return 0
+    app = picked.split("\t")[0].strip()
+    # Re-read: the daemon may have recorded something while the menu was open.
+    assignments, writable = writable_config(True)
+    if writable and assignments.pop(app, None) is not None:
+        kb.save_config(assignments)
+        kb.notify(f"{app} back to the default")
+    return 0
 
-    if cmd == "clear-ui":
-        # Interactive counterpart to [H[2J[3J, so the Omarchy menu can offer it without
-        # the caller having to know an app's window class by heart.
-        d = load()
-        if not d:
-            subprocess.run(["omarchy-notification-send", "Keyboard layout",
-                            "No assignments to clear"], check=False)
-            return 0
-        rows = [f"󰅖\t{app}\t{layout}" for app, layout in sorted(d.items())]
-        picked = menu("Clear layout for app", rows)
-        if not picked:
-            return 0
-        app = picked.split("	")[0].strip()
-        if d.pop(app, None) is not None:
-            save(d)
-            subprocess.run(["omarchy-notification-send", "Keyboard layout",
-                            f"{app} back to the default"], check=False)
-        return 0
 
-    if cmd == "clear" and len(argv) >= 3:
-        d = load()
-        if d.pop(argv[2], None) is None:
-            print(f"{argv[2]} had no assignment")
-        else:
-            save(d); print(f"{argv[2]} → default (US)")
-        return 0
-
-    # UI: pick an app, then a layout. Assigned apps are listed first so the menu doubles
-    # as a view of what is already set.
-    assigned = load()
-    running = running_classes()
-    installed = installed_classes()
+def cmd_ui(args):
+    # Pick an app, then a layout. Assigned apps are listed first so the menu doubles as a
+    # view of what is already set.
+    assigned, _ = kb.load_config()
+    running = kb.running_classes()
+    installed = kb.installed_classes()
     apps = sorted(running | set(assigned) | set(installed), key=str.lower)
     if not apps:
-        print("nothing to assign", file=sys.stderr)
+        err("nothing to assign")
         return 1
 
     # omarchy-menu-select reads the FIRST tab-separated field as an ICON GLYPH, the second
     # as the label and the third as subtext. Passing "app\tlayout" therefore drew the app
     # name on top of the layout. Always lead with a glyph.
     rows = []
-    for a in apps:
-        glyph = "󰌌" if a in assigned else ("󰖯" if a in running else "󰀻")
-        sub = assigned.get(a) or ("running" if a in running else installed.get(a, ""))
-        rows.append(f"{glyph}\t{a}\t{sub}" if sub else f"{glyph}\t{a}")
-    picked = menu("Set layout for app", rows)
+    for app in apps:
+        glyph = "󰌌" if app in assigned else ("󰖯" if app in running else "󰀻")
+        sub = assigned.get(app) or ("running" if app in running else installed.get(app, ""))
+        rows.append(f"{glyph}\t{app}\t{sub}" if sub else f"{glyph}\t{app}")
+    picked = kb.menu("Set layout for app", rows)
     if not picked:
         return 0
-    app = picked.split("\t")[0].strip()
+    app = kb.clean_name(picked.split("\t")[0].strip())
+    if not app:
+        return 0
 
     names = layout_names()
     if not names:
-        print("no multi-layout keyboard found", file=sys.stderr)
+        err("no multi-layout keyboard found")
         return 1
-    choice = menu(f"Layout for {app}", [*names, "Default (US)"])
+    choice = kb.menu(f"Layout for {app}", [*names, DEFAULT_ROW])
     if not choice:
         return 0
 
-    d = load()
-    if choice.startswith("Default"):
-        d.pop(app, None); save(d)
+    assignments, writable = writable_config(True)
+    if not writable:
+        return 1
+    if choice == DEFAULT_ROW:
+        if assignments.pop(app, None) is not None:
+            kb.save_config(assignments)
         print(f"{app} → default (US)")
-    else:
-        d[app] = choice; save(d)
+    elif choice in names:
+        result = kb.assign(assignments, app, choice)
+        if result == "full":
+            err(f"{kb.MAX_APPS} apps already have a layout; clear one first")
+            kb.notify(f"{kb.MAX_APPS} apps already have a layout; clear one first")
+            return 1
+        if result == "changed":
+            kb.save_config(assignments)
         print(f"{app} → {choice}")
     return 0
 
-sys.exit(main(sys.argv))
+
+COMMANDS = {
+    "ui": cmd_ui,
+    "list": cmd_list,
+    "set": cmd_set,
+    "clear": cmd_clear,
+    "clear-ui": cmd_clear_ui,
+    "devices": cmd_devices,
+    "layouts": cmd_layouts,
+    "cycle": cmd_cycle,
+}
+
+# Started by the bar widget, so they end with the shell.
+WIDGET_COMMANDS = {"devices", "layouts", "cycle"}
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "ui"
+    handler = COMMANDS.get(cmd)
+    if handler is None:
+        return usage()
+    if cmd in WIDGET_COMMANDS:
+        safe.die_with_parent()
+    kb.exit_cleanly_on_signals()
+    try:
+        return handler(argv[2:])
+    except (safe.UnsafeError, OSError) as e:
+        err(str(e))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,2 +1,3 @@
 KeyboardLayout.qml.orig
 *.tmp
+__pycache__/
