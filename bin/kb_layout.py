@@ -1,7 +1,11 @@
-"""Shared plumbing for the keyboard-layout-per-app helpers: the assignments file, bounded
-hyprctl / xkbcli / menu calls, and the input limits both helpers enforce.
+"""Shared plumbing for the keyboard-layout-per-app helpers: the assignments file, requests
+to Hyprland's sockets, bounded xkbcli / menu calls, and the input limits both helpers
+enforce.
 
-Everything external goes through plugin_safety (vendored, identical to the shared copy):
+Hyprland's sockets are reached from $XDG_RUNTIME_DIR one component at a time without
+following symlinks, only when every directory and the socket belong to us, and every reply
+is size-capped with a deadline. Everything else external goes through plugin_safety
+(vendored, identical to the shared copy):
 
   * programs resolve to root-owned binaries in /usr/bin -- never PATH -- and run with
     PATH=/usr/bin, a deadline, an output ceiling and a whole-process-group kill. Each one is
@@ -21,8 +25,10 @@ import math
 import os
 import re
 import signal
+import socket
 import stat
 import sys
+import time
 
 import plugin_safety as safe
 
@@ -139,10 +145,126 @@ def exit_cleanly_on_signals():
         signal.signal(sig, handler)
 
 
-# ------------------------------------------------------------------ hyprctl
+# ------------------------------------------------------------------ Hyprland IPC
+
+# Both of Hyprland's sockets are spoken to directly rather than through hyprctl. A layout
+# switch has to land as one request (see switch_all), and the daemon reads the seat on
+# every layout change, which a process per reading would make slow enough to race typing.
+SIGNATURE = re.compile(r"[A-Za-z0-9_.-]{1,128}")
+SOCKETS = (".socket.sock", ".socket2.sock")
+
+
+def _owned_dir(name, dir_fd):
+    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+    st = os.fstat(fd)
+    if st.st_uid != os.getuid() or st.st_mode & 0o022:
+        os.close(fd)
+        raise safe.UnsafeError(f"{name}: directory is not ours or is group/other-writable")
+    return fd
+
+
+def socket_fd(signature, name):
+    """O_PATH descriptor of $XDG_RUNTIME_DIR/hypr/<signature>/<name>, reached one component
+    at a time without following symlinks, and only if every directory and the socket itself
+    belong to us."""
+    if not SIGNATURE.fullmatch(signature or "") or signature in (".", ".."):
+        raise safe.UnsafeError("invalid Hyprland instance signature")
+    if name not in SOCKETS:
+        raise safe.UnsafeError(f"not a Hyprland socket: {name!r}")
+    fd = os.open(safe.runtime_dir(), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if st.st_uid != os.getuid() or st.st_mode & 0o022:
+            raise safe.UnsafeError("runtime directory is not ours or is group/other-writable")
+        for part in ("hypr", signature):
+            next_fd = _owned_dir(part, fd)
+            os.close(fd)
+            fd = next_fd
+        sock = os.open(name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+        st = os.fstat(sock)
+        if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
+            os.close(sock)
+            raise safe.UnsafeError(f"{name} is not a socket we own")
+        return sock
+    finally:
+        os.close(fd)
+
+
+def find_signature():
+    signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if signature:
+        return signature
+    try:
+        entries = safe.list_dir(os.path.join(safe.runtime_dir(), "hypr"), max_entries=64)
+    except (safe.UnsafeError, OSError):
+        return None
+    candidates = sorted(((st.st_mtime, name) for name, st in entries
+                         if stat.S_ISDIR(st.st_mode) and SIGNATURE.fullmatch(name)), reverse=True)
+    for _, name in candidates:
+        try:
+            os.close(socket_fd(name, ".socket2.sock"))
+            return name
+        except (safe.UnsafeError, OSError):
+            continue
+    return None
+
+
+def connect(name, timeout=None):
+    """A socket connected to Hyprland's `name` socket, or None when no instance is found.
+    Connecting through the checked descriptor means the path checked is the socket
+    connected to; nothing can be swapped in between."""
+    signature = find_signature()
+    if not signature:
+        return None
+    fd = socket_fd(signature, name)
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC)
+        try:
+            sock.settimeout(timeout)
+            sock.connect(f"/proc/self/fd/{fd}")
+        except OSError:
+            sock.close()
+            raise
+        return sock
+    finally:
+        os.close(fd)
+
+
+def hypr_request(command, *, timeout=HYPRCTL_TIMEOUT, max_output=HYPRCTL_MAX_OUTPUT):
+    """Hyprland's reply to one request, sent the way hyprctl sends it, or None for any
+    failure: no instance, a reply past max_output, or no whole reply within `timeout`
+    seconds in total."""
+    deadline = time.monotonic() + timeout
+    try:
+        sock = connect(".socket.sock", timeout)
+    except (safe.UnsafeError, OSError) as e:
+        log(f"hyprland socket: {e}")
+        return None
+    if sock is None:
+        log("no hyprland instance found")
+        return None
+    with sock:
+        try:
+            sock.sendall(command.encode("utf-8"))
+            chunks, size = [], 0
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return None
+                sock.settimeout(left)
+                chunk = sock.recv(65536)
+                if not chunk:
+                    return b"".join(chunks)
+                size += len(chunk)
+                if size > max_output:
+                    return None
+                chunks.append(chunk)
+        except OSError:                     # socket.timeout included
+            return None
+
 
 def hypr_json(what):
-    blob = output_of(["hyprctl", "-j", what], timeout=HYPRCTL_TIMEOUT, max_output=HYPRCTL_MAX_OUTPUT)
+    blob = hypr_request(f"j/{what}")
     if blob is None:
         return None
     try:
@@ -161,22 +283,72 @@ def seat_keyboards():
 
 
 def switchable_keyboards(keyboards=None):
-    """Keyboards carrying more than one layout, under a name hyprctl can be handed. On a
-    laptop that is often ten devices (lid switch, power button, hotkeys...), and all of
-    them are switched together."""
+    """Keyboards carrying more than one layout, under a name Hyprland can be handed. On a
+    laptop that is often ten devices (lid switch, power button, hotkeys...)."""
     if keyboards is None:
         keyboards = seat_keyboards()
     return [k for k in keyboards or []
             if device_name(k.get("name")) and isinstance(k.get("layout"), str) and "," in k["layout"]]
 
 
-def switch_layout(device, target):
-    """hyprctl switchxkblayout for one device; target is "next", "prev" or a layout index."""
+# An input method (fcitx5) injects the keys it does not consume through a virtual keyboard
+# of its own, and copies the layout of the keyboard it grabbed onto it. Its layout follows
+# the real keyboards', so it is never read and never taken as someone's choice. wtype and
+# friends create these too, with keymaps whose layouts may have no name at all.
+VIRTUAL_PREFIX = "hl-virtual-keyboard"
+# The names KeyboardLayoutModel.js leaves out of its label: devices Hyprland calls keyboards
+# that nobody types on. They still carry the seat's layout and are switched with it.
+_UNTYPED = re.compile(r"(?:hl-virtual-keyboard|power-button|sleep-button|lid-switch|video-bus)")
+# What Hyprland reports for a layout without a name, or a keyboard without a keymap.
+UNNAMED = ("error", "none")
+
+
+def is_virtual(name):
+    return isinstance(name, str) and name.startswith(VIRTUAL_PREFIX)
+
+
+def physical_keyboards(keyboards):
+    return [k for k in switchable_keyboards(keyboards) if not is_virtual(k["name"])]
+
+
+def layout_index(keyboard):
+    index = keyboard.get("active_layout_index")
+    return index if type(index) is int and 0 <= index < MAX_LAYOUTS else None
+
+
+def seat_index(keyboards, named=None):
+    """The layout index the seat is on, read from keyboards that are not virtual: the one
+    `named` (the keyboard an event said had switched) while it is still there, else the
+    index most typed keyboards agree on, the earliest listed winning a tie."""
+    physical = [k for k in physical_keyboards(keyboards) if layout_index(k) is not None]
+    for keyboard in physical:
+        if named and keyboard["name"] == named:
+            return layout_index(keyboard)
+    typed = [k for k in physical if not _UNTYPED.match(k["name"])] or physical
+    if not typed:
+        return None
+    counts = {}
+    for keyboard in typed:
+        counts[layout_index(keyboard)] = counts.get(layout_index(keyboard), 0) + 1
+    best = max(counts.values())
+    return next(layout_index(k) for k in typed if counts[layout_index(k)] == best)
+
+
+def switch_all(target):
+    """Every keyboard on the seat to `target` ("next", "prev" or a layout index) in ONE
+    request. Hyprland walks its keyboards inside that request, so nothing runs between two
+    of them. One request per keyboard let fcitx5 copy the first keyboard's new layout onto
+    its virtual keyboard before the loop got there, and the loop then advanced that one
+    again: text came out one layout past the one chosen, and that is what got recorded."""
     target = str(target)
-    if not device_name(device) or not _LAYOUT_TARGET.fullmatch(target):
+    if not _LAYOUT_TARGET.fullmatch(target):
         return False
-    return output_of(["hyprctl", "switchxkblayout", device, target],
-                     timeout=HYPRCTL_TIMEOUT, max_output=4096) is not None
+    return hypr_request(f"switchxkblayout all {target}", max_output=4096) is not None
+
+
+def active_class():
+    window = hypr_json("activewindow")
+    return clean_name(window.get("class")) if isinstance(window, dict) else None
 
 
 def widget_keyboards(keyboards):
@@ -237,6 +409,66 @@ def layout_listing(text):
             break
         out.append(piece)
     return "\n".join(out)
+
+
+# ------------------------------------------------------------------ layout names
+
+# kb_rules/kb_model/kb_layout/kb_variant/kb_options as Hyprland reports them. They become
+# xkbcli arguments, so only plain xkb name lists pass.
+_RMLVO_FIELDS = ("rules", "model", "layout", "variant", "options")
+_RMLVO_VALUE = re.compile(r"[A-Za-z0-9_.,:+()-]{0,256}")
+# How xkbcommon prints a layout's name inside xkb_symbols: name[2]="Ukrainian"; (name[Group2]
+# in the older keymap format).
+_GROUP_NAME = re.compile(r'\s*name\[(?:Group)?([0-9]{1,2})\]\s*=\s*"([^"\\]*)";\s*')
+XKB_KEYMAP_MAX_OUTPUT = 4 * 1024 * 1024
+
+
+def rmlvo(keyboard):
+    """The (rules, model, layout, variant, options) a keyboard's keymap was compiled from,
+    or None when one is missing or is not a plain xkb name list."""
+    values = tuple(keyboard.get(field, "") for field in _RMLVO_FIELDS)
+    if all(isinstance(v, str) and _RMLVO_VALUE.fullmatch(v) for v in values):
+        return values
+    return None
+
+
+def layout_table(names):
+    """Layout names in kb_layout order for an rmlvo() tuple, as xkbcommon names them -- the
+    library, and so the names, Hyprland itself uses -- or [] unless every one can be had.
+    Nothing is switched to find them."""
+    if not names:
+        return []
+    argv = ["xkbcli", "compile-keymap"]
+    argv += [f"--{field}={value}" for field, value in zip(_RMLVO_FIELDS, names) if value]
+    blob = output_of(argv, timeout=XKBCLI_TIMEOUT, max_output=XKB_KEYMAP_MAX_OUTPUT)
+    if blob is None:
+        return []
+    found = {}
+    for line in blob.decode("utf-8", "replace").split("\n"):
+        match = _GROUP_NAME.fullmatch(line)
+        if match and clean_name(match[2]) and match[2] not in UNNAMED:
+            found.setdefault(int(match[1]), match[2])
+    table = [found.get(i) for i in range(1, min(len(found), MAX_LAYOUTS) + 1)]
+    return table if table and all(table) else []
+
+
+def seat_names(keyboards, table=layout_table):
+    """(rmlvo, names) for the seat's physical multi-layout keyboards: xkbcommon's names for
+    the first one's keymap, overwritten by what each keyboard compiled the same way reports
+    for the layout it is on now -- that report is what Hyprland will say again. A name
+    neither source has is None."""
+    physical = physical_keyboards(keyboards)
+    if not physical:
+        return None, []
+    key = rmlvo(physical[0])
+    names = list(table(key)) if key else []
+    for keyboard in physical:
+        index, name = layout_index(keyboard), clean_name(keyboard.get("active_keymap"))
+        if rmlvo(keyboard) != key or index is None or not name or name in UNNAMED:
+            continue
+        names.extend([None] * (index + 1 - len(names)))
+        names[index] = name
+    return key, names
 
 
 # ------------------------------------------------------------------ assignments file

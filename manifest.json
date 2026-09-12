@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "reidenxerx.keyboard-layout-per-app",
   "name": "Keyboard layout per app",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "ReidenXerx",
   "description": "Remembers the keyboard layout per application and restores it on focus. Left-click cycles, right-click assigns.",
   "kinds": ["bar-widget"],

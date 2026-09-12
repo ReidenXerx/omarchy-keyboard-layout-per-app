@@ -1,11 +1,12 @@
 #!/usr/bin/python3
 """python3 tests/helpers_test.py -- the helpers' limits, file handling, process handling and
-event logic.
+Hyprland requests. The daemon's event logic is tested in tests/memory_test.py.
 
 Files live in a sandbox under $XDG_RUNTIME_DIR with the module's path constants pointed at
-it. hyprctl, menus and notifications are replaced by a recorder: no test switches a real
-layout, opens a menu or touches the real assignments file. The only real programs run are
-sleep/yes (process bounds), node (model equivalence) and read-only `xkbcli list`."""
+it. Requests to Hyprland, menus and notifications are replaced by recorders, and the socket
+tests talk to a server of their own: no test switches a real layout, opens a menu or touches
+the real assignments file. The only real programs run are sleep/yes (process bounds), node
+(model equivalence) and read-only `xkbcli list` / `xkbcli compile-keymap`."""
 import contextlib
 import hashlib
 import importlib.machinery
@@ -22,6 +23,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -59,13 +61,26 @@ class Recorder:
         return self.responses.get(tuple(argv[:3]), b"")
 
 
+class Requests:
+    """Stands in for kb.hypr_request: records each request to Hyprland, answers from a table
+    (None, a failed request, for anything not in it)."""
+
+    def __init__(self):
+        self.sent = []
+        self.responses = {}
+
+    def __call__(self, command, *, timeout=kb.HYPRCTL_TIMEOUT, max_output=kb.HYPRCTL_MAX_OUTPUT):
+        self.sent.append(command)
+        return self.responses.get(command)
+
+
 class Sandbox(unittest.TestCase):
     def setUp(self):
         self.root = pathlib.Path(tempfile.mkdtemp(prefix="kb-layout-test-", dir=safe.runtime_dir()))
         os.chmod(self.root, 0o700)
         self.saved = {name: getattr(kb, name) for name in
                       ("CONFIG", "LEGACY", "USER_APP_DIR", "SYSTEM_APP_DIRS", "output_of", "notify",
-                       "menu", "running_classes", "installed_classes")}
+                       "menu", "running_classes", "installed_classes", "hypr_request")}
         self.saved_layout_names = assign_cli.layout_names
         self.saved_signals = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
         kb.CONFIG = str(self.root / "config" / "kb-layout-per-app.json")
@@ -74,6 +89,8 @@ class Sandbox(unittest.TestCase):
         kb.SYSTEM_APP_DIRS = ()
         self.hypr = Recorder()
         kb.output_of = self.hypr
+        self.ipc = Requests()
+        kb.hypr_request = self.ipc
         self.notes = []
         kb.notify = self.notes.append
         kb._last_log[0] = None
@@ -97,174 +114,6 @@ class Sandbox(unittest.TestCase):
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = fn(*args)
         return rc, out.getvalue(), err.getvalue()
-
-
-# ------------------------------------------------------------------ event framing
-
-class Framing(unittest.TestCase):
-    def test_lines_split_across_chunks(self):
-        r = daemon.LineReader()
-        self.assertEqual(r.feed(b"activewindow>>fo"), [])
-        self.assertEqual(r.feed(b"ot,title\nactivelayout>>kb,US\n"),
-                         [b"activewindow>>foot,title", b"activelayout>>kb,US"])
-
-    def test_oversized_frame_dropped_next_kept(self):
-        r = daemon.LineReader(max_line=16, max_buffer=64)
-        self.assertEqual(r.feed(b"x" * 40 + b"\nok\n"), [b"ok"])
-        self.assertEqual(r.dropped, 1)
-
-    def test_oversized_frame_across_chunks_dropped_whole(self):
-        r = daemon.LineReader(max_line=16, max_buffer=64)
-        for chunk in (b"y" * 10, b"y" * 10, b"y" * 30):
-            self.assertEqual(r.feed(chunk), [])
-            self.assertLessEqual(len(r.buf), 16)
-        self.assertEqual(r.feed(b"tail-of-it\nnext\n"), [b"next"])
-        self.assertEqual(r.dropped, 1)
-
-    def test_memory_stays_bounded_without_newlines(self):
-        r = daemon.LineReader()
-        for _ in range(2000):
-            r.feed(b"z" * daemon.RECV_SIZE)
-            self.assertLessEqual(len(r.buf), daemon.MAX_EVENT_LINE)
-        self.assertEqual(r.feed(b"\nactivewindow>>foot,\n"), [b"activewindow>>foot,"])
-
-    def test_buffer_overflow_resets(self):
-        r = daemon.LineReader(max_line=16, max_buffer=64)
-        self.assertEqual(r.feed(b"a\n" * 40), [])
-        self.assertEqual(r.dropped, 1)
-        self.assertEqual(r.feed(b"rest\nok\n"), [b"ok"])
-
-    def test_parse_events(self):
-        p = daemon.parse_event
-        self.assertEqual(p(b"activewindow>>org.telegram.desktop,Chat, with comma"), ("window", "org.telegram.desktop"))
-        self.assertEqual(p(b"activewindow>>,"), ("window", ""))
-        self.assertEqual(p(b"activelayout>>at-translated-set-2-keyboard,English (US, intl., with dead keys)"),
-                         ("layout", "English (US, intl., with dead keys)"))
-        self.assertIsNone(p(b"activelayout>>no-comma"))
-        self.assertIsNone(p(b"activewindowv2>>0x1234"))
-        self.assertIsNone(p(b"workspace>>2"))
-        self.assertEqual(p(b"activewindow>>\xff,x"), ("window", "�"))
-
-
-# ------------------------------------------------------------------ layout memory
-
-class FakeSeat:
-    def __init__(self, assignments=None, writable=True):
-        self.assignments = dict(assignments or {})
-        self.writable = writable
-        self.layout = "English (US)"
-        self.saved, self.applied = [], []
-
-    def load(self):
-        return dict(self.assignments), self.writable
-
-    def save(self, assignments):
-        self.saved.append(dict(assignments))
-        self.assignments = dict(assignments)
-
-    def current(self):
-        return self.layout
-
-    def apply_index(self, index):
-        self.applied.append(("index", index))
-        self.layout = "English (US)"
-
-    def apply_name(self, name):
-        self.applied.append(("name", name))
-        self.layout = name
-
-    def memory(self):
-        return daemon.LayoutMemory(self.load, self.save, self.current, self.apply_index, self.apply_name)
-
-
-class Memory(unittest.TestCase):
-    def setUp(self):
-        kb._last_log[0] = None
-        self.err = contextlib.redirect_stderr(io.StringIO())
-        self.err.__enter__()
-
-    def tearDown(self):
-        self.err.__exit__(None, None, None)
-
-    def test_restores_assignment_and_ignores_its_echo(self):
-        seat = FakeSeat({"telegram": "Ukrainian"})
-        m = seat.memory()
-        m.window("telegram")
-        self.assertEqual(seat.applied, [("name", "Ukrainian")])
-        for _ in range(10):                 # one echo per keyboard device
-            m.layout("Ukrainian")
-        self.assertEqual(seat.saved, [])
-
-    def test_records_user_choice_once(self):
-        seat = FakeSeat()
-        m = seat.memory()
-        m.window("foot")
-        self.assertEqual(seat.applied, [("index", 0)])
-        m.layout("English (US)")            # echo of the default
-        seat.layout = "Ukrainian"
-        m.layout("Ukrainian")
-        m.layout("Ukrainian")
-        self.assertEqual(seat.saved, [{"foot": "Ukrainian"}])
-
-    def test_refocusing_the_same_class_does_nothing(self):
-        seat = FakeSeat()
-        m = seat.memory()
-        m.window("foot")
-        m.window("foot")
-        m.window("")
-        self.assertEqual(seat.applied, [("index", 0)])
-        self.assertEqual(m.cls, "foot")
-
-    def test_unusable_class_gets_default_and_records_nothing(self):
-        for bad in ("x" * (kb.MAX_NAME + 1), "bad\tclass", "esc\x1b[31m"):
-            seat = FakeSeat({"telegram": "Ukrainian"})
-            m = seat.memory()
-            m.window("telegram")
-            m.window(bad)
-            self.assertIsNone(m.cls)
-            self.assertEqual(seat.applied[-1], ("index", 0))
-            seat.layout = "Russian"
-            m.layout("Russian")
-            self.assertEqual(seat.saved, [], bad)
-
-    def test_unusable_layout_is_not_recorded(self):
-        seat = FakeSeat()
-        m = seat.memory()
-        m.window("foot")
-        m.layout("L" * (kb.MAX_NAME + 1))
-        m.layout("Ukr\x1b[31m")
-        self.assertEqual(seat.saved, [])
-
-    def test_cap_refuses_new_apps_but_updates_existing(self):
-        full = {f"app{i}": "Ukrainian" for i in range(kb.MAX_APPS)}
-        seat = FakeSeat(full)
-        m = seat.memory()
-        m.window("newapp")
-        seat.layout = "Russian"
-        m.layout("Russian")
-        self.assertEqual(seat.saved, [])
-        m.window("app1")
-        seat.layout = "Russian"
-        m.layout("Russian")
-        self.assertEqual(len(seat.saved), 1)
-        self.assertEqual(seat.saved[0]["app1"], "Russian")
-        self.assertEqual(len(seat.saved[0]), kb.MAX_APPS)
-
-    def test_unusable_file_is_never_written(self):
-        seat = FakeSeat(writable=False)
-        m = seat.memory()
-        m.window("foot")
-        seat.layout = "Ukrainian"
-        m.layout("Ukrainian")
-        self.assertEqual(seat.saved, [])
-
-    def test_assign_results(self):
-        d = {"a": "x"}
-        self.assertEqual(kb.assign(d, "a", "x"), "unchanged")
-        self.assertEqual(kb.assign(d, "a", "y"), "changed")
-        full = {str(i): "x" for i in range(kb.MAX_APPS)}
-        self.assertEqual(kb.assign(full, "new", "x"), "full")
-        self.assertNotIn("new", full)
 
 
 # ------------------------------------------------------------------ assignments file
@@ -299,10 +148,13 @@ class Config(Sandbox):
         self.assertEqual(self.load(), ({}, False))
         with self.assertRaises(safe.UnsafeError):
             kb.save_config({"foot": "Ukrainian"})
-        m = daemon.LayoutMemory(current=lambda: "English (US)", apply_index=lambda i: None, apply_name=lambda n: None)
+        seat = TwoLayoutSeat()
+        m = daemon.LayoutMemory(seat)
         with contextlib.redirect_stderr(io.StringIO()):
-            m.window("foot")
-            m.layout("Ukrainian")
+            m.start()
+            m.handle([("window", "foot")])
+            seat.index = 1                  # a switch the daemon would record
+            m.handle([("layout", "kbd")])
         self.assertEqual(victim.read_text(), '{"a": "b"}')
         self.assertTrue(os.path.islink(kb.CONFIG))
 
@@ -331,10 +183,13 @@ class Config(Sandbox):
     def test_broken_hand_edit_is_left_for_its_author(self):
         self.write(kb.CONFIG, '{"foot": ')
         self.assertEqual(self.load(), ({}, False))
-        m = daemon.LayoutMemory(current=lambda: "English (US)", apply_index=lambda i: None, apply_name=lambda n: None)
+        seat = TwoLayoutSeat()
+        m = daemon.LayoutMemory(seat)
         with contextlib.redirect_stderr(io.StringIO()):
-            m.window("foot")
-            m.layout("Ukrainian")
+            m.start()
+            m.handle([("window", "foot")])
+            seat.index = 1                  # a switch the daemon would record
+            m.handle([("layout", "kbd")])
         self.assertEqual(pathlib.Path(kb.CONFIG).read_text(), '{"foot": ')
 
     def test_empty_file_is_an_empty_table(self):
@@ -391,9 +246,10 @@ class AssignCli(Sandbox):
         self.assertIn("had no assignment", self.cli("clear", "foot")[1])
 
     def test_bad_arguments_do_not_fall_into_the_menu(self):
-        for args in (("set", "foot"), ("set", "a\tb", "US"), ("set", "x" * 300, "US"), ("bogus",), ("cycle",), ("cycle", "-j")):
+        for args in (("set", "foot"), ("set", "a\tb", "US"), ("set", "x" * 300, "US"), ("bogus",), ("cycle", "-j"),
+                     ("cycle", "kbd", "extra")):
             self.assertEqual(self.cli(*args)[0], 2, args)
-        self.assertEqual(self.hypr.calls, [])
+        self.assertEqual((self.hypr.calls, self.ipc.sent), ([], []))
 
     def test_set_refuses_past_the_cap(self):
         kb.save_config({f"app{i}": "x" for i in range(kb.MAX_APPS)})
@@ -407,11 +263,11 @@ class AssignCli(Sandbox):
         self.assertEqual(self.cli("set", "foot", "Ukrainian")[0], 1)
         self.assertEqual(pathlib.Path(kb.CONFIG).read_text(), "{oops")
 
-    def test_devices_prints_nothing_when_hyprctl_fails(self):
-        self.hypr.responses[("hyprctl", "-j", "devices")] = None
+    def test_devices_prints_nothing_when_hyprland_fails(self):
+        self.ipc.responses["j/devices"] = None
         rc, out, _ = self.quiet(assign_cli.cmd_devices, [])
         self.assertEqual((rc, out), (1, ""))
-        self.hypr.responses[("hyprctl", "-j", "devices")] = b'{"mice": []}'
+        self.ipc.responses["j/devices"] = b'{"mice": []}'
         self.assertEqual(self.quiet(assign_cli.cmd_devices, [])[:2], (1, ""))
 
     def test_devices_is_bounded_and_reduced(self):
@@ -420,7 +276,7 @@ class AssignCli(Sandbox):
                 "active_layout_index": 1, "active_keymap": "Ukrainian", "capsLock": False, "main": True}
         odd = {"name": "evil\tname", "layout": 5, "active_layout_index": True, "active_keymap": "x" * 300}
         seat = {"keyboards": [good, odd] + [dict(good, name=f"kbd-{i}") for i in range(100)]}
-        self.hypr.responses[("hyprctl", "-j", "devices")] = json.dumps(seat).encode()
+        self.ipc.responses["j/devices"] = json.dumps(seat).encode()
         rc, out, _ = self.quiet(assign_cli.cmd_devices, [])
         self.assertEqual(rc, 0)
         listed = json.loads(out)["keyboards"]
@@ -431,14 +287,16 @@ class AssignCli(Sandbox):
         self.assertLess(len(out), 64 * 1024)
 
     def test_devices_empty_seat_is_reported(self):
-        self.hypr.responses[("hyprctl", "-j", "devices")] = b'{"keyboards": []}'
+        self.ipc.responses["j/devices"] = b'{"keyboards": []}'
         self.assertEqual(self.quiet(assign_cli.cmd_devices, [])[:2], (0, '{"keyboards": []}\n'))
 
-    def test_cycle_switches_only_the_named_keyboard(self):
-        self.hypr.responses[("hyprctl", "switchxkblayout", "at-translated-set-2-keyboard")] = b"ok"
-        self.assertEqual(assign_cli.cmd_cycle(["at-translated-set-2-keyboard"]), 0)
-        self.assertEqual(self.hypr.calls[0][0], ["hyprctl", "switchxkblayout", "at-translated-set-2-keyboard", "next"])
-        self.assertLessEqual(self.hypr.calls[0][2], 4096)
+    def test_cycle_switches_every_keyboard_in_one_request(self):
+        self.ipc.responses["switchxkblayout all next"] = b"ok"
+        self.assertEqual(assign_cli.cmd_cycle([]), 0)
+        self.assertEqual(assign_cli.cmd_cycle(["at-translated-set-2-keyboard"]), 0)  # an older widget's call
+        self.assertEqual(self.ipc.sent, ["switchxkblayout all next"] * 2)
+        self.ipc.responses.clear()
+        self.assertEqual(assign_cli.cmd_cycle([]), 1)
 
     def test_layouts_prints_the_filtered_listing(self):
         listing = "layouts:\n- layout: 'us'\n  variant: ''\n  brief: 'en'\n  description: English (US)\n"
@@ -491,14 +349,17 @@ class AssignCli(Sandbox):
         self.assertEqual(self.cli("clear-ui")[0], 0)
         self.assertEqual(self.notes[-1], "No assignments to clear")
 
-    def test_layout_names_cycles_the_first_keyboard_and_returns_to_zero(self):
+    def test_layout_names_are_read_never_switched(self):
         seat = {"keyboards": [{"name": "power-button", "layout": "us"},
-                              {"name": "kbd", "layout": "us,ua,ru", "active_keymap": "English (US)"}]}
-        self.hypr.responses[("hyprctl", "-j", "devices")] = json.dumps(seat).encode()
-        self.hypr.responses[("hyprctl", "switchxkblayout", "kbd")] = b"ok"
-        self.assertEqual(self.saved_layout_names(), ["English (US)"] * 3)
-        switches = [c[0][2:] for c in self.hypr.calls if c[0][1] == "switchxkblayout"]
-        self.assertEqual(switches, [["kbd", "0"], ["kbd", "1"], ["kbd", "2"], ["kbd", "0"]])
+                              {"name": "hl-virtual-keyboard-fcitx5", "layout": "us,ua,ru", "active_layout_index": 2,
+                               "active_keymap": "error"},
+                              {"name": "kbd", "address": "0x2", "rules": "", "model": "", "layout": "us,ua,ru",
+                               "variant": "", "options": "", "active_layout_index": 1, "active_keymap": "Ukrainian"}]}
+        self.ipc.responses["j/devices"] = json.dumps(seat).encode()
+        self.hypr.responses[("xkbcli", "compile-keymap", "--layout=us,ua,ru")] = KEYMAP
+        self.assertEqual(self.saved_layout_names(), ["English (US)", "Ukrainian", "Russian"])
+        self.assertEqual(self.ipc.sent, ["j/devices"])
+        self.assertEqual([c[0] for c in self.hypr.calls], [["xkbcli", "compile-keymap", "--layout=us,ua,ru"]])
 
     def test_menu_rows_and_limits(self):
         self.hypr.responses[("omarchy-menu-select", "Pick", "a")] = b"a\n"
@@ -511,6 +372,45 @@ class AssignCli(Sandbox):
 
 
 # ------------------------------------------------------------------ names and argv
+
+# The part of `xkbcli compile-keymap` output layout_table() reads, beside the level names in
+# xkb_types that look like it.
+KEYMAP = b"""xkb_keymap {
+xkb_types "complete" {
+\ttype "ONE_LEVEL" {
+\t\tlevel_name[1]= "Any";
+\t};
+};
+xkb_symbols "pc+us+ua:2+ru:3" {
+\tname[1]="English (US)";
+\tname[2]="Ukrainian";
+\tname[3]="Russian";
+\tkey <AE01> { [ 1, exclam ] };
+};
+};
+"""
+
+
+class TwoLayoutSeat:
+    """One keyboard with two layouts, for tests that only need the daemon to see a switch."""
+
+    def __init__(self):
+        self.index = 0
+
+    def keyboards(self):
+        return [{"name": "kbd", "address": "0x1", "rules": "", "model": "", "layout": "us,ua", "variant": "",
+                 "options": "", "active_layout_index": self.index,
+                 "active_keymap": ("English (US)", "Ukrainian")[self.index]}]
+
+    def switch(self, index):
+        self.index = index
+
+    def active_class(self):
+        return None
+
+    def table(self, rmlvo):
+        return ["English (US)", "Ukrainian"]
+
 
 class Names(Sandbox):
     def test_clean_name(self):
@@ -525,23 +425,72 @@ class Names(Sandbox):
         for bad in ("-j", "--batch", "a b", "a;b", "", "x" * 129, 5, None, "a b", "kb\x00"):
             self.assertIsNone(kb.device_name(bad), repr(bad))
 
-    def test_switch_layout_refuses_bad_input_without_running_anything(self):
-        for device, target in (("-r", "next"), ("kb", "1; reload"), ("kb", "-1"), ("kb", "999"), ("kb", "next next")):
-            self.assertFalse(kb.switch_layout(device, target))
-        self.assertEqual(self.hypr.calls, [])
-        kb.switch_layout("kb", 0)
-        self.assertEqual(self.hypr.calls[0][0], ["hyprctl", "switchxkblayout", "kb", "0"])
+    def test_switch_all_refuses_bad_targets_without_asking_hyprland(self):
+        for target in ("1; reload", "-1", "999", "next next", "all", ""):
+            self.assertFalse(kb.switch_all(target))
+        self.assertEqual(self.ipc.sent, [])
+        self.ipc.responses["switchxkblayout all 0"] = b"ok"
+        self.assertTrue(kb.switch_all(0))
+        self.assertFalse(kb.switch_all("next"))     # no reply: the request failed
+        self.assertEqual(self.ipc.sent, ["switchxkblayout all 0", "switchxkblayout all next"])
 
     def test_switchable_keyboards_skips_unaddressable_devices(self):
         seat = [{"name": "kb", "layout": "us,ua"}, {"name": "-x", "layout": "us,ua"},
                 {"name": "single", "layout": "us"}, {"name": "nolayout"}]
         self.assertEqual([k["name"] for k in kb.switchable_keyboards(seat)], ["kb"])
 
-    def test_hyprctl_output_limits(self):
-        self.hypr.responses[("hyprctl", "-j", "devices")] = b"[" * 100 + b"]" * 100
+    def test_hyprland_json_is_bounded(self):
+        self.ipc.responses["j/devices"] = b"[" * 100 + b"]" * 100
         self.assertIsNone(kb.seat_keyboards())
+        self.assertEqual(self.ipc.sent, ["j/devices"])
+
+    def test_seat_index_reads_physical_keyboards(self):
+        def k(name, index):
+            return {"name": name, "layout": "us,ua,ru", "active_layout_index": index}
+        seat = [k("power-button", 0), k("video-bus", 0), k("at-translated-set-2-keyboard", 1),
+                k("usb-keyboard", 1), k("hl-virtual-keyboard-fcitx5", 2),
+                {"name": "single", "layout": "us", "active_layout_index": 0}]
+        self.assertEqual(kb.seat_index(seat), 1)                        # typed keyboards outvote buttons
+        self.assertEqual(kb.seat_index(seat, named="video-bus"), 0)     # the keyboard that switched
+        self.assertEqual(kb.seat_index(seat, named="hl-virtual-keyboard-fcitx5"), 1)
+        self.assertEqual(kb.seat_index(seat, named="gone"), 1)
+        self.assertEqual(kb.seat_index([k("power-button", 2)]), 2)
+        self.assertEqual(kb.seat_index([k("a", 0), k("b", 2)]), 0)      # a tie goes to the earliest
+        self.assertIsNone(kb.seat_index([k("hl-virtual-keyboard", 1)]))
+        self.assertIsNone(kb.seat_index([dict(k("kbd", 0), active_layout_index=True)]))
+
+    def test_rmlvo_passes_only_plain_xkb_names(self):
+        good = {"rules": "", "model": "pc105", "layout": "us,ua(winkeys)", "variant": ",",
+                "options": "grp:alt_shift_toggle,compose:caps"}
+        self.assertEqual(kb.rmlvo(good), ("", "pc105", "us,ua(winkeys)", ",", "grp:alt_shift_toggle,compose:caps"))
+        for field, bad in (("layout", "us ua"), ("options", 'x"y'), ("model", None), ("variant", "a\nb"),
+                           ("layout", "x" * 300)):
+            self.assertIsNone(kb.rmlvo(dict(good, **{field: bad})), (field, bad))
+
+    def test_layout_table_reads_xkbcommon_names(self):
+        rmlvo = ("", "", "us,ua,ru", "", "grp:alt_shift_toggle")
+        key = ("xkbcli", "compile-keymap", "--layout=us,ua,ru")
+        self.hypr.responses[key] = KEYMAP
+        self.assertEqual(kb.layout_table(rmlvo), ["English (US)", "Ukrainian", "Russian"])
         argv, timeout, cap = self.hypr.calls[0]
-        self.assertEqual((timeout, cap), (kb.HYPRCTL_TIMEOUT, 256 * 1024))
+        self.assertEqual(argv, ["xkbcli", "compile-keymap", "--layout=us,ua,ru", "--options=grp:alt_shift_toggle"])
+        self.assertEqual((timeout, cap), (kb.XKBCLI_TIMEOUT, kb.XKB_KEYMAP_MAX_OUTPUT))
+        self.hypr.responses[key] = KEYMAP.replace(b'\tname[2]="Ukrainian";\n', b"")
+        self.assertEqual(kb.layout_table(rmlvo), [])                    # a gap: none of it is trusted
+        self.hypr.responses[key] = None
+        self.assertEqual(kb.layout_table(rmlvo), [])
+        self.assertEqual(kb.layout_table(None), [])
+
+    def test_seat_names_take_what_keyboards_report_over_the_table(self):
+        seat = [{"name": "hl-virtual-keyboard", "layout": "us,ua,ru", "active_layout_index": 0, "active_keymap": "Klingon"},
+                {"name": "kbd", "layout": "us,ua,ru", "active_layout_index": 1, "active_keymap": "Ukrainian (legacy)"},
+                {"name": "odd", "layout": "us,ua,ru", "active_layout_index": 2, "active_keymap": "error"},
+                {"name": "other", "layout": "de,fr", "active_layout_index": 0, "active_keymap": "German"}]
+        key, names = kb.seat_names(seat, table=lambda r: ["English (US)", "Ukrainian", "Russian"])
+        self.assertEqual(key, ("", "", "us,ua,ru", "", ""))
+        self.assertEqual(names, ["English (US)", "Ukrainian (legacy)", "Russian"])
+        self.assertEqual(kb.seat_names(seat[1:2], table=lambda r: [])[1], [None, "Ukrainian (legacy)"])
+        self.assertEqual(kb.seat_names([], table=lambda r: ["x"]), (None, []))
 
 
 # ------------------------------------------------------------------ xkb listing
@@ -605,6 +554,12 @@ class Listing(unittest.TestCase):
         huge = "".join(block.format(i) for i in range(20000))
         out = kb.layout_listing(huge)
         self.assertLessEqual(len(out.encode()), kb.LAYOUTS_MAX_OUTPUT)
+
+    @unittest.skipUnless(os.path.exists("/usr/bin/xkbcli"), "xkbcli missing")
+    def test_layout_table_from_the_real_xkbcli(self):
+        self.assertEqual(kb.layout_table(("", "", "us,ua", "", "grp:alt_shift_toggle")), ["English (US)", "Ukrainian"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(kb.layout_table(("", "", "zz-not-a-layout", "", "")), [])
 
 
 # ------------------------------------------------------------------ processes (real, bounded)
@@ -692,11 +647,12 @@ class Desktop(Sandbox):
         self.assertTrue(all(kb.clean_name(c) and kb.clean_name(n) for c, n in found.items()))
 
 
-# ------------------------------------------------------------------ the event socket
+# ------------------------------------------------------------------ Hyprland's sockets
 
-class EventSocket(Sandbox):
+class HyprlandSockets(Sandbox):
     def setUp(self):
         super().setUp()
+        kb.hypr_request = self.saved["hypr_request"]
         self.saved_runtime = safe.runtime_dir
         self.saved_env = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
         root = str(self.root)
@@ -713,19 +669,19 @@ class EventSocket(Sandbox):
             self.server.close()
         super().tearDown()
 
-    def listen(self, signature):
+    def listen(self, signature, name=".socket2.sock"):
         directory = self.root / "hypr" / signature
         directory.mkdir(parents=True, mode=0o700)
         os.chmod(self.root / "hypr", 0o700)
         self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.server.bind(str(directory / ".socket2.sock"))
+        self.server.bind(str(directory / name))
         self.server.listen(1)
         return directory
 
     def test_connects_and_reads(self):
         self.listen("abc_123")
         os.environ["HYPRLAND_INSTANCE_SIGNATURE"] = "abc_123"
-        client = daemon.connect_events()
+        client = kb.connect(".socket2.sock")
         conn, _ = self.server.accept()
         conn.sendall(b"activewindow>>foot,x\n")
         self.assertEqual(daemon.LineReader().feed(client.recv(4096)), [b"activewindow>>foot,x"])
@@ -736,7 +692,7 @@ class EventSocket(Sandbox):
         self.listen("real")
         (self.root / "hypr" / "empty").mkdir()
         os.environ.pop("HYPRLAND_INSTANCE_SIGNATURE", None)
-        self.assertEqual(daemon.find_signature(), "real")
+        self.assertEqual(kb.find_signature(), "real")
 
     def test_refuses_symlinks_and_bad_signatures(self):
         directory = self.listen("real")
@@ -744,18 +700,65 @@ class EventSocket(Sandbox):
         os.symlink(directory / ".socket2.sock", self.root / "hypr" / "linked" / ".socket2.sock")
         os.symlink(directory, self.root / "hypr" / "aliased")
         with self.assertRaises(safe.UnsafeError):
-            daemon.event_socket_fd("linked")
+            kb.socket_fd("linked", ".socket2.sock")
         with self.assertRaises((safe.UnsafeError, OSError)):
-            daemon.event_socket_fd("aliased")
+            kb.socket_fd("aliased", ".socket2.sock")
         for bad in ("..", "../real", "a/b", ""):
             with self.assertRaises(safe.UnsafeError):
-                daemon.event_socket_fd(bad)
+                kb.socket_fd(bad, ".socket2.sock")
+
+    def serve(self, reply, silent=False):
+        """Answer one request on .socket.sock from a thread; returns what the client sent."""
+        self.listen("sig", ".socket.sock")
+        os.environ["HYPRLAND_INSTANCE_SIGNATURE"] = "sig"
+        got = []
+
+        def run():
+            conn, _ = self.server.accept()
+            with conn:
+                got.append(conn.recv(4096))
+                if silent:
+                    time.sleep(1)
+                else:
+                    conn.sendall(reply)
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        return got, thread
+
+    def test_request_roundtrip(self):
+        got, thread = self.serve(b'{"keyboards": []}')
+        self.assertEqual(kb.hypr_request("j/devices"), b'{"keyboards": []}')
+        thread.join(2)
+        self.assertEqual(got, [b"j/devices"])
+
+    def test_request_reply_past_the_cap_is_refused(self):
+        _, thread = self.serve(b"x" * 10000)
+        self.assertIsNone(kb.hypr_request("j/devices", max_output=1024))
+        thread.join(2)
+
+    def test_request_without_a_reply_gives_up_on_time(self):
+        _, thread = self.serve(b"", silent=True)
+        start = time.monotonic()
+        self.assertIsNone(kb.hypr_request("j/devices", timeout=0.3))
+        self.assertLess(time.monotonic() - start, 1)
+        thread.join(2)
+
+    def test_request_without_an_instance_fails_quietly(self):
+        os.environ["HYPRLAND_INSTANCE_SIGNATURE"] = "nothing-here"
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNone(kb.hypr_request("j/devices"))
+
+    def test_only_hyprlands_two_sockets(self):
+        self.listen("real")
+        for name in ("../real/.socket2.sock", ".socket3.sock", "hyprland.lock"):
+            with self.assertRaises(safe.UnsafeError):
+                kb.socket_fd("real", name)
 
     def test_refuses_loose_directories(self):
         self.listen("real")
         os.chmod(self.root / "hypr", 0o777)
         with self.assertRaises(safe.UnsafeError):
-            daemon.event_socket_fd("real")
+            kb.socket_fd("real", ".socket2.sock")
 
 
 # ------------------------------------------------------------------ static rules

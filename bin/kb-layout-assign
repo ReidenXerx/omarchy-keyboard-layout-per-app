@@ -12,7 +12,7 @@ For the bar widget -- bounded, machine-readable:
   kb-layout-assign devices            keyboards as JSON (name, layout, active_keymap,
                                       active_layout_index); prints nothing if hyprctl failed
   kb-layout-assign layouts            the brief/description lines of `xkbcli list --load-exotic`
-  kb-layout-assign cycle <keyboard>   advance one keyboard to its next layout
+  kb-layout-assign cycle              every keyboard to its next layout, in one request
 
 Assignments are read live by kb-layout-daemon, so changes apply on the next focus --
 nothing to restart. The file is plain JSON and safe to hand-edit.
@@ -60,33 +60,24 @@ def cmd_layouts(args):
 
 
 def cmd_cycle(args):
-    if len(args) != 1 or not kb.device_name(args[0]):
+    # Widgets older than this helper still name a keyboard; it is checked and ignored,
+    # because every keyboard is switched together, in one request (kb.switch_all).
+    if len(args) > 1 or (args and not kb.device_name(args[0])):
         return usage()
-    return 0 if kb.switch_layout(args[0], "next") else 1
+    return 0 if kb.switch_all("next") else 1
 
 
 # ------------------------------------------------------------------ assignments
 
 def layout_names():
-    """Display names in kb_layout order. Derived by cycling a keyboard and reading the name
-    back, because Hyprland exposes codes ("us,ua,ru") and names ("Ukrainian") separately
-    with no mapping between them."""
-    keyboards = kb.switchable_keyboards()
+    """Display names in kb_layout order, as xkbcommon names the seat's keymap. They used to
+    be found by switching a keyboard through every layout and reading each name back, which
+    the daemon took for choices made in the focused app, and which left that keyboard on
+    the first layout while the others stayed where they were."""
+    keyboards = kb.seat_keyboards()
     if not keyboards:
         return []
-    device = keyboards[0]["name"]
-    codes = keyboards[0]["layout"].split(",")[:kb.MAX_LAYOUTS]
-    names = []
-    for index in range(len(codes)):
-        kb.switch_layout(device, index)
-        for keyboard in kb.seat_keyboards() or []:
-            if keyboard.get("name") == device:
-                name = kb.clean_name(keyboard.get("active_keymap"))
-                if name:
-                    names.append(name)
-                break
-    kb.switch_layout(device, 0)
-    return names
+    return [name for name in kb.seat_names(keyboards)[1] if name]
 
 
 def writable_config(interactive):

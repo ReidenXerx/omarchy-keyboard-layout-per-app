@@ -5,20 +5,25 @@ Focus Telegram, switch to Ukrainian, focus the terminal -- it returns to US. Foc
 again and Ukrainian comes back. KDE and Windows do this; Hyprland has a single global
 layout, so this supplies the memory.
 
-Apps with no assignment get layout INDEX 0 (first in kb_layout, i.e. US). Index rather than
-name because Hyprland reports display names ("English (US)") that vary with locale, while
-the index is stable.
+Apps with no assignment get layout INDEX 0 (first in kb_layout, i.e. US). Assignments are
+stored by layout name, as Hyprland reports it, and applied by the index xkbcommon gives
+that name in the current kb_layout.
 
 Keyed by window CLASS, so a second window of the same app inherits the choice.
 
 Assignments live in ~/.config/omarchy/kb-layout-per-app.json -- hand-editable, and managed
 by `kb-layout-assign`.
 
-Two Hyprland quirks shape this:
-  * layout is per DEVICE and a laptop can expose ten keyboards, so all multi-layout devices
-    switch together or the one you type on drifts out of sync.
-  * applying a layout emits activelayout events of its own; those are recognised by VALUE
-    (see LayoutMemory.window), or restoring a remembered layout would re-record it.
+Hyprland shapes this in three ways:
+  * layout is per DEVICE: a laptop can expose ten keyboards, and an input method (fcitx5)
+    adds a virtual one it injects keys through, copying onto it the layout of the keyboard
+    it grabbed. Every keyboard is switched in ONE request (kb.switch_all), so the input
+    method cannot copy a layout in between and have it advanced twice.
+  * applying a layout, a reload compiling the keymap again, and a keyboard being plugged in
+    all emit activelayout, exactly like a switch. So events are never taken at their word:
+    they only prompt a reading of the seat, and a physical keyboard that has left the index
+    this daemon last put the seat on is what counts as a choice (see LayoutMemory.sync).
+  * virtual keyboards follow the real ones, so their events and layouts are ignored.
 
 Bounds: the daemon exits with the shell that started it; event frames over
 MAX_EVENT_LINE are dropped and the read buffer never holds more than MAX_EVENT_BUFFER;
@@ -26,9 +31,7 @@ class and layout names over kb_layout.MAX_NAME characters, or with control chara
 never stored; at most kb_layout.MAX_APPS apps are remembered.
 """
 import os
-import re
-import socket
-import stat
+import select
 import sys
 import time
 
@@ -40,7 +43,11 @@ import kb_layout as kb  # noqa: E402
 MAX_EVENT_LINE = 4 * 1024
 MAX_EVENT_BUFFER = 64 * 1024
 RECV_SIZE = 4096
-_SIGNATURE = re.compile(r"[A-Za-z0-9_.-]{1,128}")
+# How long the socket has to stay quiet after a layout event before the seat is read, and
+# the most that reading can be put off by a steady stream of events.
+SETTLE_QUIET = 0.04
+SETTLE_MAX = 0.25
+MAX_TABLES = 8
 
 
 # ------------------------------------------------------------------ event framing
@@ -88,197 +95,219 @@ class LineReader:
 
 
 def parse_event(line):
-    """("window", class) or ("layout", layout name) for the two events acted on, else None.
-    Values are raw; LayoutMemory checks them."""
-    event = line.decode("utf-8", "replace")
-    if event.startswith("activewindow>>"):
-        return "window", event.split(">>", 1)[1].split(",", 1)[0].strip()
-    if event.startswith("activelayout>>"):
-        payload = event.split(">>", 1)[1]
+    """("window", class), ("layout", keyboard) or ("reload", "") for the events acted on,
+    else None. An activelayout's layout name is not kept: the seat is read instead. Values
+    are raw; LayoutMemory checks them."""
+    name, _, payload = line.decode("utf-8", "replace").partition(">>")
+    if name == "activewindow":
+        return "window", payload.split(",", 1)[0].strip()
+    if name == "activelayout":
         if "," not in payload:
             return None
-        # keyboard,layout -- the layout name may itself contain commas
-        return "layout", payload.split(",", 1)[1].strip()
+        return "layout", payload.split(",", 1)[0].strip()
+    if name == "configreloaded":
+        return "reload", ""
     return None
 
 
-# ------------------------------------------------------------------ applying layouts
-
-def current_layout():
-    keyboards = kb.switchable_keyboards()
-    for keyboard in keyboards:
-        if keyboard.get("main"):
-            return keyboard.get("active_keymap")
-    return keyboards[0].get("active_keymap") if keyboards else None
+def parse_events(lines):
+    return [event for event in map(parse_event, lines) if event is not None]
 
 
-def apply_index(index):
-    for keyboard in kb.switchable_keyboards():
-        kb.switch_layout(keyboard["name"], index)
+# ------------------------------------------------------------------ the seat
 
+class Seat:
+    """What LayoutMemory asks of Hyprland and xkbcommon; tests hand it their own."""
 
-def apply_name(name):
-    keyboards = kb.switchable_keyboards()
-    if not keyboards:
-        return
-    count = min(len(keyboards[0]["layout"].split(",")), kb.MAX_LAYOUTS)
-    for _ in range(count):
-        if current_layout() == name:
-            return
-        for keyboard in keyboards:
-            kb.switch_layout(keyboard["name"], "next")
-        time.sleep(0.05)
+    def __init__(self):
+        self.tables = {}
+
+    def keyboards(self):
+        return kb.seat_keyboards()
+
+    def switch(self, index):
+        kb.switch_all(index)
+
+    def active_class(self):
+        return kb.active_class()
+
+    def table(self, rmlvo):
+        if rmlvo not in self.tables:
+            if len(self.tables) >= MAX_TABLES:
+                self.tables.clear()
+            self.tables[rmlvo] = kb.layout_table(rmlvo)
+        return self.tables[rmlvo]
 
 
 class LayoutMemory:
     """Applies an app's layout when it is focused and records the layout chosen while it is.
-    The hyprctl and file operations are parameters so tests can observe them."""
+    Hyprland and the assignments file are parameters so tests can stand in for them."""
 
-    def __init__(self, load=kb.load_config, save=kb.save_config, current=current_layout,
-                 apply_index=apply_index, apply_name=apply_name):
-        self.load, self.save, self.current = load, save, current
-        self.apply_index, self.apply_name = apply_index, apply_name
+    def __init__(self, seat, load=kb.load_config, save=kb.save_config):
+        self.seat, self.load, self.save = seat, load, save
         self.cls = None
-        self.expected = None
+        self.expected = None        # the layout index this daemon last put the seat on
+        self.rmlvo, self.names = None, []
+        self.known = set()          # (name, address) of the physical keyboards last read
+        self.changed = None         # physical keyboard named by a layout event not yet read
+        self.reloaded = False
 
-    def window(self, new):
-        if not new or new == self.cls:
+    # -- reading the seat
+
+    def read(self):
+        """(keyboards, remapped, added) or None when Hyprland could not be asked. remapped:
+        the keymap is not the one last read; added: physical keyboards not there last time
+        (a new address, so one plugged back in after suspend counts too)."""
+        keyboards = self.seat.keyboards()
+        if keyboards is None:
+            return None
+        rmlvo, names = kb.seat_names(keyboards, self.seat.table)
+        remapped = self.rmlvo is not None and rmlvo != self.rmlvo
+        self.rmlvo, self.names = rmlvo, names
+        seen = {(k["name"], k.get("address")) for k in kb.physical_keyboards(keyboards)}
+        added = {name for name, _ in seen - self.known} if self.known else set()
+        self.known = seen
+        return keyboards, remapped, added
+
+    def index_for(self, cls):
+        """Where cls's assigned layout sits in kb_layout; 0 when it has none, or names one
+        kb_layout no longer carries."""
+        want = self.load()[0].get(cls)
+        if want and want in self.names:
+            return self.names.index(want)
+        if want:
+            kb.log(f"{cls} is assigned {want!r}, which kb_layout does not have; using the first layout")
+        return 0
+
+    def settle(self, keyboards, index):
+        """Every keyboard onto `index`, in one request, unless all of them already are."""
+        self.expected = index
+        if any(kb.layout_index(k) != index for k in kb.switchable_keyboards(keyboards)):
+            self.seat.switch(index)
+
+    # -- events
+
+    def start(self):
+        """Adopt the seat as it is: nothing is applied or recorded until something changes,
+        so restarting the shell never moves the layout under your fingers. Keyboards left on
+        different layouts (by an older version, or anything switching them one at a time)
+        are brought back onto the one most of them are on."""
+        self.cls = self.seat.active_class()
+        reading = self.read()
+        if reading is None:
             return
-        if kb.clean_name(new) is None:
+        index = kb.seat_index(reading[0])
+        if index is not None:
+            self.settle(reading[0], index)
+
+    def window(self, cls):
+        if cls and cls == self.cls:
+            return
+        if not cls:
+            # Focus left every window (an empty workspace): no app to restore for, and a
+            # switch made now belongs to none. Coming back re-applies the app's layout.
+            self.cls = None
+            return
+        if kb.clean_name(cls) is None:
             # A class too long or odd to store can never have an assignment, so it gets what
-            # every unassigned app gets -- and no layout is recorded against it, or against
-            # the app focused before it.
+            # every unassigned app gets -- and nothing is recorded against it.
             kb.log("focused window has an unusable class; using the default layout")
             self.cls = None
-            self.apply_index(0)
-            self.expected = self.current()
+            self.expected = 0
+            self.seat.switch(0)
             return
-        self.cls = new
-        want = self.load()[0].get(new)     # re-read: kb-layout-assign may have changed it
-        if want:
-            if want != self.current():
-                self.apply_name(want)
-        else:
-            self.apply_index(0)            # unassigned apps default to the first layout
-        # Remember what WE just set. Applying a layout emits activelayout events, and a time
-        # window cannot bound them reliably: apply_* runs hyprctl once per keyboard (ten on a
-        # laptop), so the echo can arrive after any fixed delay and be recorded as if the
-        # user had chosen it -- which overwrote a real assignment during testing. Matching
-        # on the value is exact regardless of timing.
-        self.expected = self.current()
+        self.cls = cls
+        if not self.names and self.read() is None:
+            return
+        self.expected = self.index_for(cls)
+        self.seat.switch(self.expected)
 
-    def layout(self, name):
+    def layout(self, keyboard):
+        if keyboard and not kb.is_virtual(keyboard):
+            self.changed = keyboard
+
+    def reload(self):
+        self.reloaded = True
+
+    def sync(self):
+        """Read the seat once for the layout events and reloads seen since the last read."""
+        changed, reloaded = self.changed, self.reloaded
+        self.changed, self.reloaded = None, False
+        reading = self.read()
+        if reading is None:
+            return
+        keyboards, remapped, added = reading
+        if reloaded or remapped:
+            # Compiling the keymap again puts every keyboard back on the first layout and
+            # announces it like a switch, and a new kb_layout moves the indices. Nobody chose
+            # either: restore the app's layout by name instead of recording one.
+            index = self.index_for(self.cls) if self.cls else kb.seat_index(keyboards)
+            if index is not None:
+                self.settle(keyboards, index)
+            return
+        current = kb.seat_index(keyboards, named=changed)
+        if current is None:
+            return
+        if self.expected is not None and current != self.expected and changed not in added:
+            self.record(current)
+        elif self.expected is not None:
+            current = self.expected         # a keyboard that just arrived joins the seat
+        self.settle(keyboards, current)
+
+    def record(self, index):
+        name = self.names[index] if index < len(self.names) else None
         if not self.cls or not name:
             return
-        if kb.clean_name(name) is None:
-            kb.log("layout name is too long or has control characters; not recording it")
-            return
-        if name == self.expected:
-            return                          # our own echo, not a user choice
         assignments, writable = self.load()
-        if assignments.get(self.cls) != name:
-            if not writable:
-                kb.log(f"not recording {self.cls}: the assignments file is unusable")
-            else:
-                result = kb.assign(assignments, self.cls, name)
-                if result == "full":
-                    kb.log(f"{kb.MAX_APPS} apps already have a layout; not remembering one for "
-                           f"{self.cls} (clear some with kb-layout-assign clear-ui)")
-                elif result == "changed":
-                    try:
-                        self.save(assignments)
-                    except (safe.UnsafeError, OSError) as e:
-                        kb.log(f"could not save assignments: {e}")
-        self.expected = name                # subsequent echoes of this switch are ours too
+        if assignments.get(self.cls) == name:
+            return
+        if not writable:
+            kb.log(f"not recording {self.cls}: the assignments file is unusable")
+            return
+        result = kb.assign(assignments, self.cls, name)
+        if result == "full":
+            kb.log(f"{kb.MAX_APPS} apps already have a layout; not remembering one for "
+                   f"{self.cls} (clear some with kb-layout-assign clear-ui)")
+        elif result == "changed":
+            try:
+                self.save(assignments)
+            except (safe.UnsafeError, OSError) as e:
+                kb.log(f"could not save assignments: {e}")
+
+    def handle(self, events):
+        """One batch of events, in order. Pending layout events are settled before focus
+        moves on, so a switch is recorded for the app it was made in."""
+        for position, (kind, value) in enumerate(events):
+            if kind == "window":
+                if position + 1 < len(events) and events[position + 1][0] == "window":
+                    continue                # focus moved on again before this was handled
+                if self.changed or self.reloaded:
+                    self.sync()
+                self.window(value)
+            elif kind == "layout":
+                self.layout(value)
+            elif kind == "reload":
+                self.reload()
+        if self.changed or self.reloaded:
+            self.sync()
 
 
-# ------------------------------------------------------------------ the event socket
-
-def _owned_dir(name, dir_fd):
-    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
-    st = os.fstat(fd)
-    if st.st_uid != os.getuid() or st.st_mode & 0o022:
-        os.close(fd)
-        raise safe.UnsafeError(f"{name}: directory is not ours or is group/other-writable")
-    return fd
-
-
-def event_socket_fd(signature):
-    """O_PATH descriptor of $XDG_RUNTIME_DIR/hypr/<signature>/.socket2.sock, reached one
-    component at a time without following symlinks, and only if every directory and the
-    socket itself belong to us."""
-    if not _SIGNATURE.fullmatch(signature or "") or signature in (".", ".."):
-        raise safe.UnsafeError("invalid Hyprland instance signature")
-    fd = os.open(safe.runtime_dir(), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    try:
-        st = os.fstat(fd)
-        if st.st_uid != os.getuid() or st.st_mode & 0o022:
-            raise safe.UnsafeError("runtime directory is not ours or is group/other-writable")
-        for part in ("hypr", signature):
-            next_fd = _owned_dir(part, fd)
-            os.close(fd)
-            fd = next_fd
-        sock = os.open(".socket2.sock", os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
-        st = os.fstat(sock)
-        if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
-            os.close(sock)
-            raise safe.UnsafeError(".socket2.sock is not a socket we own")
-        return sock
-    finally:
-        os.close(fd)
-
-
-def find_signature():
-    signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
-    if signature:
-        return signature
-    try:
-        entries = safe.list_dir(os.path.join(safe.runtime_dir(), "hypr"), max_entries=64)
-    except (safe.UnsafeError, OSError):
-        return None
-    candidates = sorted(((st.st_mtime, name) for name, st in entries
-                         if stat.S_ISDIR(st.st_mode) and _SIGNATURE.fullmatch(name)), reverse=True)
-    for _, name in candidates:
-        try:
-            os.close(event_socket_fd(name))
-            return name
-        except (safe.UnsafeError, OSError):
-            continue
-    return None
-
-
-def connect_events():
-    signature = find_signature()
-    if not signature:
-        return None
-    fd = event_socket_fd(signature)
-    try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC)
-        try:
-            # Connecting through the descriptor means the path checked above is the socket
-            # connected to; nothing can be swapped in between.
-            sock.connect(f"/proc/self/fd/{fd}")
-        except OSError:
-            sock.close()
-            raise
-        return sock
-    finally:
-        os.close(fd)
-
+# ------------------------------------------------------------------ main loop
 
 def main():
     safe.die_with_parent()
     kb.exit_cleanly_on_signals()
     try:
-        sock = connect_events()
+        sock = kb.connect(".socket2.sock")
     except (safe.UnsafeError, OSError) as e:
         print(f"kb-layout-daemon: {e}", file=sys.stderr)
         return 1
     if sock is None:
         print("kb-layout-daemon: no hyprland event socket", file=sys.stderr)
         return 1
-    reader, memory, dropped = LineReader(), LayoutMemory(), 0
+    reader, memory, dropped = LineReader(), LayoutMemory(Seat()), 0
     with sock:
+        memory.start()
         while True:
             try:
                 chunk = sock.recv(RECV_SIZE)
@@ -287,15 +316,26 @@ def main():
                 return 1
             if not chunk:
                 break
-            for line in reader.feed(chunk):
-                event = parse_event(line)
-                if event is None:
-                    continue
-                kind, value = event
-                if kind == "window":
-                    memory.window(value)
-                else:
-                    memory.layout(value)
+            events = parse_events(reader.feed(chunk))
+            if any(kind != "window" for kind, _ in events):
+                # A switch announces itself once per keyboard, and a reload announces its
+                # keymap resets before configreloaded: read on until the socket is quiet, so
+                # one reading of the seat settles all of it.
+                deadline = time.monotonic() + SETTLE_MAX
+                while time.monotonic() < deadline:
+                    if not select.select([sock], [], [], SETTLE_QUIET)[0]:
+                        break
+                    try:
+                        chunk = sock.recv(RECV_SIZE)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break               # the next recv sees the end as well
+                    events += parse_events(reader.feed(chunk))
+            try:
+                memory.handle(events)
+            except Exception as e:  # noqa: BLE001 - one bad batch must not end per-app layouts
+                kb.log(f"handling events failed: {type(e).__name__}: {e}")
             if reader.dropped != dropped:
                 dropped = reader.dropped
                 kb.log(f"dropped {dropped} oversized event frame(s)")

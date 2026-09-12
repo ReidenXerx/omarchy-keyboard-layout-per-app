@@ -31,7 +31,7 @@ hl.config({ input = {
 
 | action | result |
 |---|---|
-| **left-click** the widget | cycle layout |
+| **left-click** the widget | next layout, on every keyboard at once |
 | **right-click** the widget | pick an app, then a layout |
 | focus an app | its remembered layout is restored |
 | switch layout while an app is focused | that becomes the app's layout |
@@ -53,24 +53,42 @@ before it is ever opened — including tray-only ones.
 ## How it works, and why it looks like this
 
 `bin/kb-layout-daemon` tails Hyprland's event socket, applying a layout on `activewindow`
-and recording one on `activelayout`. The widget starts it via `Process { running: true }`
-rather than an autostart entry: a plugin cannot edit someone's hypr config, and tying the
-daemon to the shell means it stops cleanly too.
+and recording one when the seat's layout changes. The widget starts it via
+`Process { running: true }`, and again if it ever exits, rather than an autostart entry: a
+plugin cannot edit someone's hypr config, and tying the daemon to the shell means it stops
+cleanly too.
 
-Three details that are easy to get wrong, each of which broke a build during development:
+Details that are easy to get wrong, each of which broke real use:
 
-- **Layout is per input DEVICE.** A laptop can expose ten keyboard devices (lid switch,
-  power button, hotkeys...). Switching only the one Hyprland flags `main` leaves the keyboard
-  you actually type on behind, and `main` moves between devices, so it cannot be hardcoded.
-  Every multi-layout device is switched together.
-- **Applying a layout emits `activelayout` events of its own.** Suppressing them on a timer
-  does not work: the apply shells out to `hyprctl` once per device, so the echo can outlast
-  any fixed window and get recorded as if the user had chosen it — silently overwriting real
-  assignments. Echoes are matched by *value* instead, which is exact regardless of timing.
-- **Unassigned apps are set by layout INDEX 0**, not by the name "English (US)". Hyprland
-  reports display names that vary with locale; the index is stable.
+- **Layout is per input DEVICE, and an input method adds one.** A laptop can expose ten
+  keyboard devices (lid switch, power button, hotkeys...), and fcitx5 injects keys through a
+  virtual keyboard of its own, copying onto it the layout of the keyboard it grabbed. That
+  copy is the layout text actually comes out in. Switching the devices one request at a
+  time let fcitx5 copy the first device's new layout before the loop reached its keyboard,
+  and the loop then advanced it again: Ukrainian on every real keyboard and on the label,
+  Russian in the text, and Russian recorded. So every change is one
+  `switchxkblayout all <index>` request, which Hyprland finishes before anything else runs.
+- **`activelayout` is not a choice.** Applying a layout, a reload recompiling the keymap, a
+  keyboard being plugged in, and the input method's keyboard following along all emit it.
+  Events only prompt a reading of the seat. A physical keyboard that has left the layout the
+  daemon last set is a choice. A keyboard that just appeared, or a reload, is put back on the
+  app's layout instead, and virtual keyboards are ignored.
+- **Layout names come from xkbcommon, not from switching.** Assignments are stored by name
+  ("Ukrainian"); `xkbcli compile-keymap` gives each name's index in the configured
+  `kb_layout`, from the same library Hyprland uses. Finding names by cycling a keyboard
+  through every layout produced exactly the events the daemon records.
+- **Unassigned apps get layout INDEX 0**, the first in `kb_layout`.
 
 Keyed by window **class**, so a second window of the same app inherits the choice.
+
+### A keybinding
+
+Bind a key to the same one-request switch, so a key can never split the seat either:
+
+```lua
+-- ~/.config/hypr/bindings.lua
+o.bind("ALT + Shift_L", "Switch keyboard layout", "hyprctl switchxkblayout all next")
+```
 
 ## Security
 
@@ -78,12 +96,17 @@ The plugin runs as you, next to other processes that also run as you, so it does
 what it reads or the paths it writes:
 
 - **No shell, no PATH.** The widget starts only its own helpers, as
-  `/usr/bin/python3 <plugin>/bin/…`. The helpers run `hyprctl`, `xkbcli`,
-  `omarchy-menu-select` and `omarchy-notification-send` by absolute path, only if they are
-  root-owned and not writable by others (`bin/plugin_safety.py`, shared by the ReidenXerx
-  plugins). Children get `PATH=/usr/bin`, a deadline, an output ceiling (hyprctl 256 KB,
-  xkbcli 2 MB, menus 64 KB) and a whole-process-group kill, and run under
-  `/usr/bin/timeout` so they die even if their helper is killed.
+  `/usr/bin/python3 <plugin>/bin/…`. The helpers run `xkbcli`, `omarchy-menu-select` and
+  `omarchy-notification-send` by absolute path, only if they are root-owned and not
+  writable by others (`bin/plugin_safety.py`, shared by the ReidenXerx plugins). Children
+  get `PATH=/usr/bin`, a deadline, an output ceiling (xkbcli 2 MB listing / 4 MB keymap,
+  menus 64 KB) and a whole-process-group kill, and run under `/usr/bin/timeout` so they die
+  even if their helper is killed.
+- **Hyprland's sockets, checked.** Requests go straight to Hyprland's control socket rather
+  than through `hyprctl`. Both sockets are reached from `$XDG_RUNTIME_DIR` one path
+  component at a time without following symlinks, only if every directory and the socket
+  belong to you, and connected through the checked descriptor. Every reply is capped at
+  256 KB with a 3 s deadline.
 - **Bounded output to QML.** `kb-layout-assign devices` prints at most 64 keyboards and only
   the four fields the widget reads; `layouts` prints only the lines the label table uses. The
   widget refuses readings over 512 KB. A stuck helper gets SIGTERM from the watchdog (it then
@@ -99,7 +122,8 @@ what it reads or the paths it writes:
   file is unreadable or not valid JSON, the plugin leaves it alone rather than overwrite it.
   The menu installer follows the same rules and never writes a side `.bak` file.
 
-Tests: `python3 tests/helpers_test.py` and `node tests/model-test.js`.
+Tests: `python3 tests/helpers_test.py`, `python3 tests/memory_test.py` and
+`node tests/model-test.js`.
 
 ## Credits
 

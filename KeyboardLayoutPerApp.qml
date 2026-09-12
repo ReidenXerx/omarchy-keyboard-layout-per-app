@@ -91,22 +91,21 @@ BarWidget {
     return KeyboardLayoutModel.selectKeyboard(typed, root.typedKeyboardName)
   }
 
-  // switchxkblayout is a hyprctl command rather than a dispatcher, so it has to
-  // be run rather than sent over the dispatch socket. It switches the keyboard
-  // the last reading spoke for, so a click always advances the device the label
-  // is describing. Switching the seat together would reach the typed keyboard
-  // without having to name it, but it would also carry the buttons along, and
-  // the whole read depends on those staying where they started: once a button
-  // has been advanced too, a toggle that wraps the keyboard back to the first
-  // layout leaves the button reading as the furthest along, and the label
-  // follows the button.
+  // switchxkblayout is a hyprctl command rather than a dispatcher, so the helper
+  // sends it to Hyprland's socket. It moves every keyboard in one request.
+  // Advancing only the keyboard the label reads left the rest behind: the
+  // buttons, and the virtual keyboard an input method like fcitx5 types
+  // through, whose layout is what text actually comes out in. The next key
+  // from any of them flipped the layout back, and the daemon recorded the
+  // wrong one. With every keyboard on one layout the label reads the same
+  // whichever keyboard it settles on.
   function cycleLayout() {
-    if (!root.keyboardName || !root.bar) return
+    if (!root.bar) return
     if (cycleProc.running) {
       root.cyclesQueued = Math.min(root.cyclesQueued + 1, 8)
       return
     }
-    cycleProc.command = [root.python, root.helper, "cycle", root.keyboardName]
+    cycleProc.command = [root.python, root.helper, "cycle"]
     cycleProc.running = true
     refreshTimer.restart()
   }
@@ -317,6 +316,15 @@ BarWidget {
     id: daemonProc
     command: [root.python, root.pluginBin + "kb-layout-daemon"]
     running: true
+    // Nothing else brings it back, and without it every app keeps whatever layout
+    // it last had: Hyprland drops an event reader that falls behind, for one.
+    onRunningChanged: if (!running) daemonRestartTimer.restart()
+  }
+
+  Timer {
+    id: daemonRestartTimer
+    interval: 3000
+    onTriggered: daemonProc.running = true
   }
 
   visible: layoutLabel !== "" && multipleLayouts
