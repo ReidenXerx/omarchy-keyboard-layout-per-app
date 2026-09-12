@@ -1,7 +1,7 @@
   "setup.keyboard-layout": {
     "icon": "󰌌",
-    "label": "Keyboard layout per app",
-    "aliases": ["layout", "keyboard", "language", "input", "raskladka"]
+    "label": "Omalang: layout per app",
+    "aliases": ["omalang", "layout", "keyboard", "language", "input", "raskladka"]
   },
   "setup.keyboard-layout.assign": {
     "icon": "󰌌",

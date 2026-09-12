@@ -1,9 +1,10 @@
-# Keyboard layout per app
+# Omalang
 
-![Keyboard layout per app](preview.png)
+![Omalang](preview.png)
 
-An [Omarchy](https://omarchy.org) bar widget that remembers the **keyboard layout per
-application** and restores it when you focus that app.
+Omalang is an [Omarchy](https://omarchy.org) bar widget that remembers the **keyboard layout
+per application** and restores it when you focus that app. It used to be called "Keyboard
+layout per app".
 
 Type Ukrainian in Telegram and English in your terminal, and stop switching by hand. KDE and
 Windows both behave this way; Hyprland has a single global layout, so this supplies the
@@ -14,8 +15,12 @@ memory.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/ReidenXerx/omarchy-keyboard-layout-per-app.git --enable
+omarchy plugin add https://github.com/ReidenXerx/omarchy-omalang.git --enable
 ```
+
+Installed it back when it was "Keyboard layout per app"? `omarchy plugin update` brings it to
+Omalang in place: the plugin id, `reidenxerx.keyboard-layout-per-app`, did not change, and the
+old repository URL redirects here.
 
 Requires more than one layout in `kb_layout` — the widget hides itself otherwise:
 
@@ -128,8 +133,8 @@ Tests: `python3 tests/helpers_test.py`, `python3 tests/memory_test.py` and
 ## Credits
 
 `KeyboardLayoutModel.js` and the widget's layout-querying logic come from Omarchy's built-in
-`omarchy.keyboard-layout` widget by David Heinemeier Hansson, MIT licensed. This plugin adds
-the per-application memory, the picker, and the daemon.
+`omarchy.keyboard-layout` widget by David Heinemeier Hansson, MIT licensed. Omalang adds the
+per-application memory, the picker, and the daemon.
 
 ## Menu entries
 
@@ -148,7 +153,7 @@ file unparseable.
 
 ```bash
 bin/kb-layout-menu-install remove
-omarchy plugin remove reidenxerx.keyboard-layout-per-app
+omarchy plugin remove reidenxerx.keyboard-layout-per-app   # Omalang's plugin id
 ```
 
 Assignments stay in `~/.config/omarchy/kb-layout-per-app.json`; delete it to forget them.
