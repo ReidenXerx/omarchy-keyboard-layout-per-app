@@ -9,7 +9,9 @@ import importlib.machinery
 import importlib.util
 import io
 import pathlib
+import shutil
 import sys
+import tempfile
 import unittest
 
 sys.dont_write_bytecode = True
@@ -17,6 +19,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 BIN = ROOT / "bin"
 sys.path.insert(0, str(BIN))
 import kb_layout as kb  # noqa: E402
+import plugin_safety as safe  # noqa: E402
 
 
 def load_script(name):
@@ -371,6 +374,128 @@ class Memory(MemoryCase):
         full = {str(i): "x" for i in range(kb.MAX_APPS)}
         self.assertEqual(kb.assign(full, "new", "x"), "full")
         self.assertNotIn("new", full)
+
+
+class Notes:
+    def __init__(self):
+        self.lines = []
+
+    def note(self, text):
+        self.lines.append(text)
+
+    def flush(self, force=False):
+        pass
+
+
+QUICK = "omagram-quick-reply"
+
+
+class Layers(MemoryCase):
+    """Layers that take the keyboard: Omagram's quick reply, the Omarchy menu."""
+
+    def memory(self, seat, store, notes=None):
+        m = daemon.LayoutMemory(seat, store.load, store.save, notes)
+        m.start()
+        return m
+
+    def test_parse_layer_events(self):
+        p = daemon.parse_event
+        self.assertEqual(p(b"openlayer>>omagram-quick-reply"), ("layer-open", QUICK))
+        self.assertEqual(p(b"closelayer>>omarchy-notifications"), ("layer-close", "omarchy-notifications"))
+        self.assertEqual(p(b"activewindow>>foot,a private title"), ("window", "foot"))
+
+    def test_a_switch_in_a_keyboard_layer_is_its_own_and_closing_it_brings_the_app_back(self):
+        # The report: a layout picked in Omagram's quick reply was saved for the terminal under
+        # it, and the terminal stayed on it after the reply closed.
+        seat, store = SimSeat(), Store({"foot": US})
+        m = self.memory(seat, store)
+        m.handle([("window", "foot")])
+        self.deliver(m, seat)
+        m.handle([("layer-open", QUICK)])
+        self.assertTrue(seat.on(0))
+        seat.next_all()
+        self.deliver(m, seat)
+        self.assertEqual(store.saved, [{"foot": US, "layer:" + QUICK: UA}])
+        self.deliver(m, seat, ("layer-close", QUICK), ("window", ""), ("window", "foot"))
+        self.assertTrue(seat.on(0))
+        self.assertEqual(len(store.saved), 1)
+        m.handle([("layer-open", QUICK)])
+        self.assertTrue(seat.on(1), "the layer's own layout comes back when it opens again")
+
+    def test_layers_that_never_take_the_keyboard_change_nothing(self):
+        seat, store = SimSeat(), Store({"telegram": UA})
+        m = self.memory(seat, store)
+        m.handle([("window", "telegram")])
+        self.deliver(m, seat)
+        m.handle([("layer-open", "omarchy-notifications"), ("layer-open", "omarchy-osd")])
+        seat.next_all()
+        self.deliver(m, seat, ("layer-close", "omarchy-notifications"))
+        self.assertEqual(store.saved, [{"telegram": RU}])
+        self.assertEqual(seat.switches, [1])
+
+    def test_focus_moving_to_another_window_leaves_the_layer(self):
+        seat, store = SimSeat(), Store({"foot": US, "telegram": UA, "layer:omarchy-menu": RU})
+        m = self.memory(seat, store)
+        m.handle([("window", "foot")])
+        m.handle([("layer-open", "omarchy-menu")])
+        self.assertTrue(seat.on(2))
+        m.handle([("window", "telegram")])          # the menu launched it
+        self.assertTrue(seat.on(1))
+        self.assertEqual(m.layers, [])
+        m.handle([("layer-close", "omarchy-menu")])
+        self.assertTrue(seat.on(1))
+
+    def test_the_window_under_an_open_layer_regaining_focus_does_not_leave_it(self):
+        seat, store = SimSeat(), Store({"foot": UA})
+        m = self.memory(seat, store)
+        m.handle([("window", "foot")])
+        m.handle([("layer-open", QUICK), ("window", ""), ("window", "foot")])
+        self.assertTrue(seat.on(0))
+        self.assertEqual(m.layers, ["layer:" + QUICK])
+
+    def test_the_log_says_what_was_decided_in_classes_and_layout_names(self):
+        seat, store, notes = SimSeat(), Store(), Notes()
+        m = self.memory(seat, store, notes)
+        m.handle([("window", "foot")])
+        m.handle([("layer-open", QUICK)])
+        seat.next_all()
+        self.deliver(m, seat, ("layer-close", QUICK))
+        text = "\n".join(notes.lines)
+        for expected in ("started: layouts English (US), Ukrainian, Russian", "focus foot: English (US)",
+                         "layer:omagram-quick-reply opened over foot: English (US)",
+                         "switched to Ukrainian in layer:omagram-quick-reply",
+                         "remembered Ukrainian for layer:omagram-quick-reply",
+                         "layer:omagram-quick-reply closed: back to foot, English (US)"):
+            self.assertIn(expected, text)
+
+
+class Decisions(unittest.TestCase):
+    def setUp(self):
+        self.dir = pathlib.Path(tempfile.mkdtemp(prefix="omalang-log-test-", dir=safe.runtime_dir()))
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.now = [1000.0]
+
+    def log(self, lines=5):
+        return kb.DecisionLog(str(self.dir / "decisions.log"), clock=lambda: self.now[0], lines=lines)
+
+    def test_bounded_written_at_most_once_a_minute_and_kept_across_restarts(self):
+        d = self.log()
+        for i in range(8):
+            d.note(f"focus app{i}\tx")
+        self.assertEqual(len(d.lines), 5)
+        self.assertTrue(d.lines[-1].endswith("focus app7?x"), d.lines[-1])
+        d.flush()
+        self.assertFalse((self.dir / "decisions.log").exists(), "not a minute yet")
+        self.now[0] += kb.DECISION_FLUSH_EVERY
+        d.flush()
+        self.assertEqual(len((self.dir / "decisions.log").read_text().splitlines()), 5)
+        d.note("one more")
+        d.flush(force=True)
+        self.assertEqual(list(self.log().lines), list(d.lines))
+
+    def test_an_oversized_log_starts_over(self):
+        (self.dir / "decisions.log").write_bytes(b"x" * 100000)
+        self.assertEqual(list(self.log().lines), [])
 
 
 class SeatTables(unittest.TestCase):

@@ -20,6 +20,7 @@ is size-capped with a deadline. Everything else external goes through plugin_saf
     character-checked before they become JSON keys, argv or menu rows, and the number of
     remembered apps is capped.
 """
+import collections
 import configparser
 import math
 import os
@@ -68,6 +69,83 @@ def log(message):
     if message != _last_log[0]:
         _last_log[0] = message
         print(f"kb-layout-per-app: {message}", file=sys.stderr, flush=True)
+
+
+# ------------------------------------------------------------------ the decision log
+
+DECISIONS = os.path.join(HOME, ".local/state/omalang/decisions.log")
+DECISION_LINES = 2000
+DECISION_LINE_MAX = 300
+# plugin_safety replaces the file atomically and fsyncs: once a minute at most while things happen, at once when
+# the daemon stops or is sent SIGUSR1.
+DECISION_FLUSH_EVERY = 60.0
+
+
+def _printable(text):
+    return "".join(ch if ch.isprintable() else "?" for ch in str(text))
+
+
+class DecisionLog:
+    """What the daemon saw and what it decided, newest last, so a layout that went wrong can be looked into
+    afterwards: the last DECISION_LINES lines, kept in ~/.local/state/omalang/decisions.log across restarts. It
+    names window classes, layer namespaces, keyboards and layouts: never window titles, and never anything typed."""
+
+    def __init__(self, path=DECISIONS, clock=time.time, lines=DECISION_LINES):
+        self.path, self.clock = path, clock
+        self.lines = collections.deque(maxlen=lines)
+        self.dirty, self.flushed = False, clock()
+        try:
+            blob = safe.read_file(path, lines * (4 * DECISION_LINE_MAX + 1))   # UTF-8: up to 4 bytes a character
+        except (OSError, safe.UnsafeError):
+            blob = None                     # missing, oversized or not ours: start a fresh log
+        for line in (blob or b"").decode("utf-8", "replace").splitlines()[-lines:]:
+            self.lines.append(_printable(line)[:DECISION_LINE_MAX])
+
+    def note(self, text):
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.clock()))
+        self.lines.append((stamp + "  " + _printable(text))[:DECISION_LINE_MAX])
+        self.dirty = True
+
+    def flush(self, force=False):
+        now = self.clock()
+        if not self.dirty or (not force and now - self.flushed < DECISION_FLUSH_EVERY):
+            return
+        self.dirty, self.flushed = False, now
+        try:
+            safe.write_file(self.path, "\n".join(self.lines) + "\n")
+        except (OSError, safe.UnsafeError) as e:
+            log(f"could not write {self.path}: {e}")
+
+
+class NoDecisions:
+    """The log for code that keeps none."""
+
+    def note(self, text):
+        pass
+
+    def flush(self, force=False):
+        pass
+
+
+# ------------------------------------------------------------------ layers that take the keyboard
+
+# Layer-shell surfaces that take the keyboard while they are open, from Omarchy's shell and its plugins. What you
+# type goes to them, so while one is open it is the app whose layout is remembered, as "layer:<namespace>".
+# Hyprland announces every layer that opens or closes but not whether it takes the keyboard, and notifications,
+# the OSD and the bar never do, so only these count.
+KEYBOARD_LAYERS = frozenset({
+    "omarchy-menu", "omarchy-clipboard", "omarchy-emojis", "omarchy-polkit", "omarchy-reminders",
+    "omarchy-network-qr", "omarchy-lock-preview", "omarchy-image-selector", "omarchy-keyboard-panel",
+    "omarchy-emoji-picker", "omarchy-barber", "omarchy-tile-blueprints", "omarchy-keyboard-cleaner",
+    "omagram-quick-reply", "omagram-quick-media", "omagram-photo", "omagram-story",
+})
+LAYER_PREFIX = "layer:"
+MAX_LAYERS_OPEN = 8
+
+
+def layer_app(namespace):
+    """The name a layer that takes the keyboard is remembered under, or None for any other layer."""
+    return LAYER_PREFIX + namespace if clean_name(namespace) and namespace in KEYBOARD_LAYERS else None
 
 
 # ------------------------------------------------------------------ names
@@ -136,8 +214,13 @@ def kill_children():
                 pass
 
 
-def exit_cleanly_on_signals():
+def exit_cleanly_on_signals(before=None):
     def handler(signum, _frame):
+        if before is not None:
+            try:
+                before()                    # the daemon's last log write
+            except Exception:  # noqa: BLE001 - stopping must not fail on it
+                pass
         kill_children()
         os._exit(128 + signum)
 

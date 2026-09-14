@@ -25,6 +25,15 @@ Hyprland shapes this in three ways:
     this daemon last put the seat on is what counts as a choice (see LayoutMemory.sync).
   * virtual keyboards follow the real ones, so their events and layouts are ignored.
 
+A layer that takes the keyboard -- the Omarchy menu, Omagram's quick reply -- sends no focus
+event, so a layout picked in it used to land on the app underneath, and closing it left that
+app on the layer's layout. While such a layer is open it is the app, remembered as
+"layer:<namespace>" (kb_layout.KEYBOARD_LAYERS), and closing it brings the app's own back.
+
+Every decision goes to ~/.local/state/omalang/decisions.log (kb_layout.DecisionLog): classes,
+layer namespaces, keyboards and layout names, never window titles. It is written at most once
+a minute, at once on SIGUSR1, and when the daemon stops.
+
 Bounds: the daemon exits with the shell that started it; event frames over
 MAX_EVENT_LINE are dropped and the read buffer never holds more than MAX_EVENT_BUFFER;
 class and layout names over kb_layout.MAX_NAME characters, or with control characters, are
@@ -32,6 +41,7 @@ never stored; at most kb_layout.MAX_APPS apps are remembered.
 """
 import os
 import select
+import signal
 import sys
 import time
 
@@ -95,12 +105,15 @@ class LineReader:
 
 
 def parse_event(line):
-    """("window", class), ("layout", keyboard) or ("reload", "") for the events acted on,
-    else None. An activelayout's layout name is not kept: the seat is read instead. Values
-    are raw; LayoutMemory checks them."""
+    """("window", class), ("layout", keyboard), ("reload", ""), ("layer-open", namespace) or
+    ("layer-close", namespace) for the events acted on, else None. An activewindow's title and
+    an activelayout's layout name are not kept: the seat is read instead. Values are raw;
+    LayoutMemory checks them."""
     name, _, payload = line.decode("utf-8", "replace").partition(">>")
     if name == "activewindow":
         return "window", payload.split(",", 1)[0].strip()
+    if name in ("openlayer", "closelayer"):
+        return ("layer-open" if name == "openlayer" else "layer-close"), payload.strip()
     if name == "activelayout":
         if "," not in payload:
             return None
@@ -143,9 +156,12 @@ class LayoutMemory:
     """Applies an app's layout when it is focused and records the layout chosen while it is.
     Hyprland and the assignments file are parameters so tests can stand in for them."""
 
-    def __init__(self, seat, load=kb.load_config, save=kb.save_config):
+    def __init__(self, seat, load=kb.load_config, save=kb.save_config, notes=None):
         self.seat, self.load, self.save = seat, load, save
+        self.notes = notes or kb.NoDecisions()
         self.cls = None
+        self.layers = []            # open layers that take the keyboard, newest last
+        self.under = None           # the app they opened over
         self.expected = None        # the layout index this daemon last put the seat on
         self.rmlvo, self.names = None, []
         self.known = set()          # (name, address) of the physical keyboards last read
@@ -177,7 +193,11 @@ class LayoutMemory:
             return self.names.index(want)
         if want:
             kb.log(f"{cls} is assigned {want!r}, which kb_layout does not have; using the first layout")
+            self.notes.note(f"{cls} is assigned {want}, which kb_layout does not have: the first layout instead")
         return 0
+
+    def name_of(self, index):
+        return self.names[index] if index is not None and 0 <= index < len(self.names) else f"layout {index}"
 
     def settle(self, keyboards, index):
         """Every keyboard onto `index`, in one request, unless all of them already are."""
@@ -195,31 +215,83 @@ class LayoutMemory:
         self.cls = self.seat.active_class()
         reading = self.read()
         if reading is None:
+            self.notes.note("started, but the keyboards could not be read")
             return
         index = kb.seat_index(reading[0])
+        self.notes.note(f"started: layouts {', '.join(self.names) or '?'}; {self.cls or 'no window'} focused; "
+                        f"keyboards on {self.name_of(index)}")
         if index is not None:
             self.settle(reading[0], index)
 
     def window(self, cls):
+        if self.layers:
+            if not cls or cls == self.under:
+                # Hyprland drops window focus and hands it back around a layer; while the layer
+                # is open it keeps the keyboard, and its close event restores the app.
+                return
+            self.notes.note(f"focus went to {cls} while {self.layers[-1]} was open: leaving the layer")
+            self.layers, self.under = [], None
         if cls and cls == self.cls:
             return
         if not cls:
             # Focus left every window (an empty workspace): no app to restore for, and a
             # switch made now belongs to none. Coming back re-applies the app's layout.
+            if self.cls:
+                self.notes.note("focus left every window")
             self.cls = None
             return
         if kb.clean_name(cls) is None:
             # A class too long or odd to store can never have an assignment, so it gets what
             # every unassigned app gets -- and nothing is recorded against it.
             kb.log("focused window has an unusable class; using the default layout")
+            self.notes.note("focused a window with an unusable class: the first layout, nothing remembered")
             self.cls = None
             self.expected = 0
             self.seat.switch(0)
             return
         self.cls = cls
         if not self.names and self.read() is None:
+            self.notes.note(f"focus {cls}: the keyboards could not be read")
             return
         self.expected = self.index_for(cls)
+        self.notes.note(f"focus {cls}: {self.name_of(self.expected)}")
+        self.seat.switch(self.expected)
+
+    def layer_open(self, namespace):
+        app = kb.layer_app(namespace)
+        if app is None or (self.layers and self.layers[-1] == app):
+            return
+        if not self.layers:
+            self.under = self.cls
+        if app in self.layers:
+            self.layers.remove(app)
+        self.layers = (self.layers + [app])[-kb.MAX_LAYERS_OPEN:]
+        self.cls = app
+        if not self.names and self.read() is None:
+            self.notes.note(f"{app} opened: the keyboards could not be read")
+            return
+        self.expected = self.index_for(app)
+        self.notes.note(f"{app} opened over {self.under or 'no window'}: {self.name_of(self.expected)}")
+        self.seat.switch(self.expected)
+
+    def layer_close(self, namespace):
+        app = kb.layer_app(namespace)
+        if app is None or app not in self.layers:
+            return
+        top = self.layers[-1] == app
+        self.layers.remove(app)
+        if not top:
+            return
+        self.cls = self.layers[-1] if self.layers else self.under
+        if not self.layers:
+            self.under = None
+        if not self.cls:
+            self.notes.note(f"{app} closed: no window to go back to")
+            return
+        if not self.names and self.read() is None:
+            return
+        self.expected = self.index_for(self.cls)
+        self.notes.note(f"{app} closed: back to {self.cls}, {self.name_of(self.expected)}")
         self.seat.switch(self.expected)
 
     def layout(self, keyboard):
@@ -235,6 +307,7 @@ class LayoutMemory:
         self.changed, self.reloaded = None, False
         reading = self.read()
         if reading is None:
+            self.notes.note("a layout event, but the keyboards could not be read")
             return
         keyboards, remapped, added = reading
         if reloaded or remapped:
@@ -242,48 +315,65 @@ class LayoutMemory:
             # announces it like a switch, and a new kb_layout moves the indices. Nobody chose
             # either: restore the app's layout by name instead of recording one.
             index = self.index_for(self.cls) if self.cls else kb.seat_index(keyboards)
+            self.notes.note(f"{'config reloaded' if reloaded else 'keymap changed'}: "
+                            f"{self.cls or 'the keyboards'} back on {self.name_of(index)}")
             if index is not None:
                 self.settle(keyboards, index)
             return
         current = kb.seat_index(keyboards, named=changed)
         if current is None:
+            self.notes.note(f"a layout event from {changed or 'a keyboard'}, but no layout could be read")
             return
         if self.expected is not None and current != self.expected and changed not in added:
+            self.notes.note(f"{changed or 'a keyboard'} switched to {self.name_of(current)} in "
+                            f"{self.cls or 'no app'} (expected {self.name_of(self.expected)})")
             self.record(current)
         elif self.expected is not None:
+            if changed in added and current != self.expected:
+                self.notes.note(f"{changed} plugged in: joins {self.name_of(self.expected)}")
             current = self.expected         # a keyboard that just arrived joins the seat
         self.settle(keyboards, current)
 
     def record(self, index):
         name = self.names[index] if index < len(self.names) else None
         if not self.cls or not name:
+            self.notes.note("not remembered: " + ("no app has the keyboard" if not self.cls else "that layout has no name"))
             return
         assignments, writable = self.load()
         if assignments.get(self.cls) == name:
             return
         if not writable:
             kb.log(f"not recording {self.cls}: the assignments file is unusable")
+            self.notes.note(f"not remembered for {self.cls}: the assignments file is unusable")
             return
         result = kb.assign(assignments, self.cls, name)
         if result == "full":
             kb.log(f"{kb.MAX_APPS} apps already have a layout; not remembering one for "
                    f"{self.cls} (clear some with kb-layout-assign clear-ui)")
+            self.notes.note(f"not remembered for {self.cls}: {kb.MAX_APPS} apps already have a layout")
         elif result == "changed":
             try:
                 self.save(assignments)
+                self.notes.note(f"remembered {name} for {self.cls}")
             except (safe.UnsafeError, OSError) as e:
                 kb.log(f"could not save assignments: {e}")
+                self.notes.note(f"could not save {name} for {self.cls}: {e}")
 
     def handle(self, events):
         """One batch of events, in order. Pending layout events are settled before focus
         moves on, so a switch is recorded for the app it was made in."""
         for position, (kind, value) in enumerate(events):
-            if kind == "window":
-                if position + 1 < len(events) and events[position + 1][0] == "window":
+            if kind in ("window", "layer-open", "layer-close"):
+                if kind == "window" and position + 1 < len(events) and events[position + 1][0] == "window":
                     continue                # focus moved on again before this was handled
                 if self.changed or self.reloaded:
                     self.sync()
-                self.window(value)
+                if kind == "window":
+                    self.window(value)
+                elif kind == "layer-open":
+                    self.layer_open(value)
+                else:
+                    self.layer_close(value)
             elif kind == "layout":
                 self.layout(value)
             elif kind == "reload":
@@ -296,7 +386,10 @@ class LayoutMemory:
 
 def main():
     safe.die_with_parent()
-    kb.exit_cleanly_on_signals()
+    notes = kb.DecisionLog()
+    kb.exit_cleanly_on_signals(before=lambda: notes.flush(force=True))
+    flush_now = [False]
+    signal.signal(signal.SIGUSR1, lambda signum, frame: flush_now.__setitem__(0, True))
     try:
         sock = kb.connect(".socket2.sock")
     except (safe.UnsafeError, OSError) as e:
@@ -305,14 +398,27 @@ def main():
     if sock is None:
         print("kb-layout-daemon: no hyprland event socket", file=sys.stderr)
         return 1
-    reader, memory, dropped = LineReader(), LayoutMemory(Seat()), 0
+    reader, memory, dropped = LineReader(), LayoutMemory(Seat(), notes=notes), 0
+    try:
+        return loop(sock, reader, memory, notes, flush_now, dropped)
+    finally:
+        notes.flush(force=True)
+
+
+def loop(sock, reader, memory, notes, flush_now, dropped):
     with sock:
         memory.start()
         while True:
+            # Awake at least once a second, so a SIGUSR1 or a quiet minute still writes the log.
+            if not select.select([sock], [], [], 1.0)[0]:
+                notes.flush(force=flush_now[0])
+                flush_now[0] = False
+                continue
             try:
                 chunk = sock.recv(RECV_SIZE)
             except OSError as e:
                 print(f"kb-layout-daemon: {e}", file=sys.stderr)
+                notes.note(f"the event socket failed: {e}")
                 return 1
             if not chunk:
                 break
@@ -336,9 +442,12 @@ def main():
                 memory.handle(events)
             except Exception as e:  # noqa: BLE001 - one bad batch must not end per-app layouts
                 kb.log(f"handling events failed: {type(e).__name__}: {e}")
+                notes.note(f"handling events failed: {type(e).__name__}: {e}")
             if reader.dropped != dropped:
                 dropped = reader.dropped
                 kb.log(f"dropped {dropped} oversized event frame(s)")
+            notes.flush(force=flush_now[0])
+            flush_now[0] = False
     return 0
 
 

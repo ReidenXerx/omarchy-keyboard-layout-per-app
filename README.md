@@ -40,10 +40,12 @@ hl.config({ input = {
 | **right-click** the widget | pick an app, then a layout |
 | focus an app | its remembered layout is restored |
 | switch layout while an app is focused | that becomes the app's layout |
+| switch layout in an overlay (the Omarchy menu, Omagram's quick reply) | the overlay keeps it; closing the overlay gives the app beneath its own back |
 | unassigned apps | first layout in `kb_layout` (index 0) |
 
 Assignments live in `~/.config/omarchy/kb-layout-per-app.json` — plain JSON, hand-editable,
-re-read on every focus, so edits apply with no restart.
+re-read on every focus, so edits apply with no restart. Overlays are stored as
+`layer:<name>`, for example `layer:omagram-quick-reply`.
 
 ```bash
 bin/kb-layout-assign            # the picker (same as right-click)
@@ -58,7 +60,7 @@ before it is ever opened — including tray-only ones.
 ## How it works, and why it looks like this
 
 `bin/kb-layout-daemon` tails Hyprland's event socket, applying a layout on `activewindow`
-and recording one when the seat's layout changes. The widget starts it via
+and when an overlay opens or closes, and recording one when the seat's layout changes. The widget starts it via
 `Process { running: true }`, and again if it ever exits, rather than an autostart entry: a
 plugin cannot edit someone's hypr config, and tying the daemon to the shell means it stops
 cleanly too.
@@ -78,6 +80,13 @@ Details that are easy to get wrong, each of which broke real use:
   Events only prompt a reading of the seat. A physical keyboard that has left the layout the
   daemon last set is a choice. A keyboard that just appeared, or a reload, is put back on the
   app's layout instead, and virtual keyboards are ignored.
+- **Overlays send no focus event.** The Omarchy menu, its clipboard and emoji pickers,
+  Omagram's quick reply and the like take the keyboard without Hyprland naming a new active
+  window. A layout picked in one was recorded for the app underneath, and that app stayed on
+  it after the overlay closed. The daemon follows `openlayer` and `closelayer` for the layers
+  that take the keyboard (`KEYBOARD_LAYERS` in `bin/kb_layout.py`): while one is open it is
+  the app, and closing it restores the layout of the app beneath. Notifications, the OSD and
+  the bar never take the keyboard, so they change nothing.
 - **Layout names come from xkbcommon, not from switching.** Assignments are stored by name
   ("Ukrainian"); `xkbcli compile-keymap` gives each name's index in the configured
   `kb_layout`, from the same library Hyprland uses. Finding names by cycling a keyboard
@@ -85,6 +94,24 @@ Details that are easy to get wrong, each of which broke real use:
 - **Unassigned apps get layout INDEX 0**, the first in `kb_layout`.
 
 Keyed by window **class**, so a second window of the same app inherits the choice.
+
+### When it picks the wrong layout
+
+The daemon writes down every decision it makes in `~/.local/state/omalang/decisions.log`:
+what got focus, which layout it got, which switch was remembered for which app, and why a
+switch was not. If an app comes back on the wrong layout, note roughly when, and read the
+lines from that minute:
+
+```text
+2026-09-14 16:02:11  focus foot: English (US)
+2026-09-14 16:02:14  layer:omagram-quick-reply opened over foot: English (US)
+2026-09-14 16:02:16  at-translated-set-2-keyboard switched to Ukrainian in layer:omagram-quick-reply (expected English (US))
+2026-09-14 16:02:16  remembered Ukrainian for layer:omagram-quick-reply
+2026-09-14 16:02:31  layer:omagram-quick-reply closed: back to foot, English (US)
+```
+
+It keeps the last 2000 decisions and is written at most once a minute;
+`pkill -USR1 -f 'bin/kb-layout-daemon$'` writes it at once.
 
 ### A keybinding
 
@@ -126,6 +153,10 @@ what it reads or the paths it writes:
   temporary file in the same directory, are fsynced and renamed over the destination. If the
   file is unreadable or not valid JSON, the plugin leaves it alone rather than overwrite it.
   The menu installer follows the same rules and never writes a side `.bak` file.
+- **A bounded decision log.** The log keeps at most 2000 lines of 300 printable characters:
+  window classes, overlay names, keyboard and layout names. Never window titles, and never
+  anything typed. It is read with a size cap and written like the assignments file, at most
+  once a minute.
 
 Tests: `python3 tests/helpers_test.py`, `python3 tests/memory_test.py` and
 `node tests/model-test.js`.
@@ -158,6 +189,10 @@ omarchy plugin remove reidenxerx.keyboard-layout-per-app   # Omalang's plugin id
 
 Assignments stay in `~/.config/omarchy/kb-layout-per-app.json`; delete it to forget them.
 The layout daemon stops with the shell, so nothing is left running.
+
+## Support
+
+If Omalang is useful to you, you can support its development on [Donatello](https://donatello.to/DuduPhudu).
 
 ## License
 
